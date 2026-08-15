@@ -1,0 +1,38 @@
+name: neom_eeg
+description: EEG device abstraction, signal processing, and closed-loop neurofeedback for the Open Neom ecosystem. Supports Emotiv, Muse, BrainBit, OpenBCI, and NeuroSky headsets.
+version: 0.1.0
+homepage: https://github.com/Cyberneom/neom_eeg
+publish_to: 'none'
+
+environment:
+  sdk: ">=3.8.0 <4.0.0"
+  flutter: ">=3.19.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  neom_core:
+    git:
+      url: git@github.com:Open-Neom/neom_core.git
+  neom_commons:
+    git:
+      url: git@github.com:Open-Neom/neom_commons.git
+
+  neom_biofeedback: ^1.0.0
+
+  sint:
+    git:
+      url: git@github.com:Open-Neom/sint.git
+
+  flutter_blue_plus: ^1.31.17
+  web_socket_channel: ^3.0.0
+  hive: ^2.2.3
+  fl_chart: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
