@@ -66,18 +66,4 @@ export 'data/implementations/eeg_signal_processor.dart';
 export 'data/implementations/eeg_biofeedback_adapter.dart';
 export 'data/implementations/eeg_session_recorder.dart';
 export 'data/implementations/eeg_neurofeedback_controller.dart';
-
-// ═══════════════════════════════════════════════════════════════
-// UI Pages
-// ═══════════════════════════════════════════════════════════════
-export 'ui/pages/eeg_monitor_page.dart';
-
-// ═══════════════════════════════════════════════════════════════
-// UI Widgets
-// ═══════════════════════════════════════════════════════════════
-export 'ui/widgets/eeg_device_picker.dart';
-export 'ui/widgets/eeg_band_meter.dart';
-export 'ui/widgets/eeg_topography.dart';
-export 'ui/widgets/eeg_raw_wave.dart';
-export 'ui/widgets/eeg_asymmetry_indicator.dart';
-export 'ui/widgets/eeg_session_timeline.dart';
+export 'data/implementations/eeg_neuro_state_adapter.dart';
