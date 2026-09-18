@@ -6,6 +6,7 @@ import 'package:neom_core/domain/use_cases/neuro_state_service.dart';
 
 import '../../domain/enums/eeg_connection_state.dart';
 import '../../domain/models/eeg_band_power.dart';
+import '../../domain/models/eeg_channel_catalog.dart';
 import '../../domain/use_cases/eeg_device_service.dart';
 
 /// Exposes a connected EEG headset as a [NeuroStateService].
@@ -26,6 +27,12 @@ import '../../domain/use_cases/eeg_device_service.dart';
 /// | alpha         | calm        |
 /// | beta          | focus       |
 /// | gamma         | integration |
+///
+/// [NeuroStateSnapshot.coherence] is hemispheric: `1 − |asymmetry|` of the
+/// dominant band over the best left/right pair the headset offers
+/// ([EegChannelCatalog.bestPair] — T7/T8 on Insight/EPOC, TP9/TP10 on Muse,
+/// AF7/AF8 on MN8…). Devices without a homologous pair fall back to the
+/// agreement between whatever channels they have.
 class EegNeuroStateAdapter implements NeuroStateService {
 
   EegNeuroStateAdapter({required this.deviceService});
@@ -62,7 +69,9 @@ class EegNeuroStateAdapter implements NeuroStateService {
 
   @override
   bool get isActive =>
-      _isActive && deviceService.connectionState == EegConnectionState.connected;
+      _isActive &&
+      (deviceService.connectionState == EegConnectionState.connected ||
+          deviceService.connectionState == EegConnectionState.streaming);
 
   @override
   Stream<NeuroStateSnapshot> get stateStream => _stateController.stream;
@@ -80,6 +89,11 @@ class EegNeuroStateAdapter implements NeuroStateService {
 
   /// The state requested through [setNeuroState], if any.
   NeomNeuroState? get targetState => _target;
+
+  /// Left/right pair the coherence was last computed on, or null when the
+  /// device has no homologous pair.
+  EegHemisphericPair? get hemisphericPair => _pair;
+  EegHemisphericPair? _pair;
 
   /// How close the reading is to [targetState], or null when none is set.
   /// 1.0 means the target is being held.
@@ -143,7 +157,8 @@ class EegNeuroStateAdapter implements NeuroStateService {
       amplitude: dominantShare.clamp(0.0, 1.0),
       frequency: _bandCenterHz[dominant]!,
       neuro: _bandState[dominant]!.normalizedValue,
-      coherence: _coherenceAcross(readings, dominant),
+      coherence: _hemisphericCoherence(readings, dominant) ??
+          _coherenceAcross(readings, dominant),
       // breath, beat and phase belong to the audio generator; a headset has
       // no source for them, so they stay at zero rather than being invented.
       timestamp: DateTime.now(),
@@ -153,8 +168,23 @@ class EegNeuroStateAdapter implements NeuroStateService {
     if (!_stateController.isClosed) _stateController.add(snapshot);
   }
 
+  /// `1 − |asymmetry index|` of [dominant] between the best homologous pair
+  /// present in [readings]; null when the device has no such pair.
+  double? _hemisphericCoherence(List<EegBandPower> readings, _Band dominant) {
+    final byChannel = {for (final r in readings) r.channel: r};
+    final pair = EegChannelCatalog.bestPair(byChannel.keys);
+    _pair = pair;
+    if (pair == null) return null;
+    final left = _bandValue(byChannel[pair.left]!, dominant);
+    final right = _bandValue(byChannel[pair.right]!, dominant);
+    final sum = left + right;
+    if (sum <= 0) return 0.0;
+    return (1.0 - ((left - right) / sum).abs()).clamp(0.0, 1.0);
+  }
+
   /// Agreement between channels on the dominant band: 1.0 when every electrode
-  /// reports the same share, falling as they diverge.
+  /// reports the same share, falling as they diverge. Fallback for layouts
+  /// without a left/right pair.
   double _coherenceAcross(List<EegBandPower> readings, _Band dominant) {
     if (readings.length < 2) return 0.0;
 

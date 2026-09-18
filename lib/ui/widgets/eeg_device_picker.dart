@@ -1,9 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:sint/sint.dart';
 
 import '../../data/implementations/eeg_connection_controller.dart';
 import '../../domain/enums/eeg_connection_state.dart';
 import '../../domain/enums/eeg_device_type.dart';
+import '../../domain/enums/eeg_vendor.dart';
 import '../../domain/models/eeg_device_info.dart';
 
 /// Device scanner and picker widget.
@@ -66,24 +69,48 @@ class _EegDevicePickerState extends State<EegDevicePicker> {
 
               const SizedBox(height: 12),
 
-              // Error state
-              if (state == EegConnectionState.error)
-                const Padding(
-                  padding: EdgeInsets.only(bottom: 8),
+              // Pending SDK approval (Cortex: approve app in EMOTIV Launcher)
+              if (controller.pendingMessage.value != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
                   child: Text(
-                    'Error de conexión. Intente de nuevo.',
-                    style: TextStyle(color: Colors.redAccent, fontSize: 13),
+                    controller.pendingMessage.value!,
+                    style: const TextStyle(color: Colors.amber, fontSize: 13),
                   ),
                 ),
 
-              // Device list
+              // Error state
+              if (state == EegConnectionState.error)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 8),
+                  child: Text(
+                    controller.lastError.value ??
+                        'Error de conexión. Intente de nuevo.',
+                    style: const TextStyle(color: Colors.redAccent, fontSize: 13),
+                  ),
+                ),
+
+              // Device list, grouped by vendor
               if (devices.isNotEmpty && connected == null)
-                ...devices.map((device) => _DeviceTile(
-                      device: device,
-                      isConnecting:
-                          state == EegConnectionState.connecting,
-                      onTap: () => _connectDevice(controller, device),
-                    )),
+                ..._groupedByVendor(devices).entries.expand((group) => [
+                      _VendorHeader(vendor: group.key),
+                      ...group.value.map((device) => _DeviceTile(
+                            device: device,
+                            isConnecting:
+                                state == EegConnectionState.connecting,
+                            onTap: () => _connectDevice(controller, device),
+                          )),
+                    ]),
+
+              // Vendors the hub could not reach (no Launcher, driver pending…)
+              if (!controller.isScanning.value &&
+                  connected == null &&
+                  (controller.skippedVendors.isNotEmpty ||
+                      controller.failedVendors.isNotEmpty))
+                _UnreachableVendors(
+                  skipped: controller.skippedVendors,
+                  failed: controller.failedVendors,
+                ),
 
               // Empty state
               if (devices.isEmpty &&
@@ -106,11 +133,25 @@ class _EegDevicePickerState extends State<EegDevicePicker> {
     );
   }
 
+  Map<EegVendor, List<EegDeviceInfo>> _groupedByVendor(
+    List<EegDeviceInfo> devices,
+  ) {
+    final map = <EegVendor, List<EegDeviceInfo>>{};
+    for (final d in devices) {
+      map.putIfAbsent(d.vendor, () => []).add(d);
+    }
+    return map;
+  }
+
   Future<void> _connectDevice(
     EegConnectionController controller,
     EegDeviceInfo device,
   ) async {
-    await showDialog(
+    // The progress dialog must not be awaited: with barrierDismissible false
+    // it only closes when we pop it after the connection settles.
+    final navigator = Navigator.of(context, rootNavigator: true);
+    var dialogOpen = true;
+    unawaited(showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
@@ -128,25 +169,113 @@ class _EegDevicePickerState extends State<EegDevicePicker> {
               device.name,
               style: const TextStyle(color: Colors.white70),
             ),
+            // Cortex asks the user to approve the app in EMOTIV Launcher;
+            // surface that here instead of leaving a silent spinner.
+            Obx(() {
+              final pending = controller.pendingMessage.value;
+              if (pending == null) return const SizedBox.shrink();
+              return Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: Text(
+                  pending,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.amber, fontSize: 12),
+                ),
+              );
+            }),
           ],
         ),
       ),
-    );
+    ).whenComplete(() => dialogOpen = false));
 
     await controller.connectDevice(device);
 
-    if (mounted) {
-      Navigator.of(context).pop();
+    if (dialogOpen && navigator.mounted) navigator.pop();
+    if (!mounted) return;
 
-      if (controller.state.value == EegConnectionState.streaming) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Conectado a ${device.name}'),
-            backgroundColor: Colors.green,
-          ),
-        );
-      }
+    if (controller.state.value == EegConnectionState.streaming) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Conectado a ${device.name}'),
+          backgroundColor: Colors.green,
+        ),
+      );
     }
+  }
+}
+
+class _VendorHeader extends StatelessWidget {
+  final EegVendor vendor;
+
+  const _VendorHeader({required this.vendor});
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 10, bottom: 4, left: 4),
+      child: Text(
+        vendor.displayName.toUpperCase(),
+        style: const TextStyle(
+          color: Colors.white38,
+          fontSize: 11,
+          letterSpacing: 1.2,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+    );
+  }
+}
+
+class _UnreachableVendors extends StatelessWidget {
+  final Map<EegVendor, String> skipped;
+  final Map<EegVendor, String> failed;
+
+  const _UnreachableVendors({required this.skipped, required this.failed});
+
+  @override
+  Widget build(BuildContext context) {
+    final rows = <MapEntry<EegVendor, String>>[
+      ...failed.entries,
+      ...skipped.entries,
+    ];
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text(
+            'No consultados',
+            style: TextStyle(color: Colors.white38, fontSize: 11),
+          ),
+          const SizedBox(height: 4),
+          for (final e in rows)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 2),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(
+                    failed.containsKey(e.key)
+                        ? Icons.error_outline
+                        : Icons.info_outline,
+                    size: 14,
+                    color: failed.containsKey(e.key)
+                        ? Colors.redAccent
+                        : Colors.white38,
+                  ),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      '${e.key.displayName}: ${e.value}',
+                      style: const TextStyle(color: Colors.white54, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
   }
 }
 
@@ -234,23 +363,13 @@ class _DeviceTile extends StatelessWidget {
     );
   }
 
-  IconData _iconForType(EegDeviceType type) {
-    switch (type) {
-      case EegDeviceType.emotivEpocX:
-      case EegDeviceType.emotivInsight:
-      case EegDeviceType.emotivMn8:
-        return Icons.headset;
-      case EegDeviceType.muse:
-        return Icons.self_improvement;
-      case EegDeviceType.neurosky:
-        return Icons.psychology;
-      case EegDeviceType.brainbit:
-      case EegDeviceType.openbci:
-        return Icons.memory;
-      case EegDeviceType.simulated:
-        return Icons.bug_report;
-    }
-  }
+  IconData _iconForType(EegDeviceType type) => switch (type.vendor) {
+        EegVendor.emotiv => Icons.headset,
+        EegVendor.interaxon => Icons.self_improvement,
+        EegVendor.neurosky => Icons.psychology,
+        EegVendor.brainbit || EegVendor.openbci => Icons.memory,
+        EegVendor.simulated => Icons.bug_report,
+      };
 }
 
 class _SignalBars extends StatelessWidget {

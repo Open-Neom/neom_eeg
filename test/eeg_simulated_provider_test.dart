@@ -1,13 +1,10 @@
 import 'dart:async';
-import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neom_eeg/data/implementations/eeg_signal_processor.dart';
 import 'package:neom_eeg/data/providers/simulated_eeg_provider.dart';
 import 'package:neom_eeg/domain/enums/eeg_connection_state.dart';
-import 'package:neom_eeg/domain/models/eeg_band_power.dart';
 import 'package:neom_eeg/domain/models/eeg_channel_info.dart';
-import 'package:neom_eeg/domain/models/eeg_device_info.dart';
 import 'package:neom_eeg/domain/models/eeg_sample.dart';
 
 void main() {
@@ -309,16 +306,11 @@ void main() {
       final devices = await provider.scan();
       await provider.connect(devices.first);
 
-      // Scan while connected — should still return the simulated device.
-      // But note: scan sets state to scanning then back to disconnected.
-      // BUG FINDER: This could break the streaming state.
+      // Scan while connected must still return the simulated device and
+      // must NOT clobber the streaming state (timers keep running).
       final devices2 = await provider.scan();
       expect(devices2, hasLength(1));
-
-      // After scan, state is disconnected — but timers may still be running.
-      // This is a real bug: scan() clobbers connectionState to disconnected
-      // without canceling timers.
-      expect(provider.connectionState, equals(EegConnectionState.disconnected));
+      expect(provider.connectionState, equals(EegConnectionState.streaming));
     });
   });
 }

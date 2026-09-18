@@ -26,20 +26,35 @@ class EegRawWave extends StatefulWidget {
 class _EegRawWaveState extends State<EegRawWave> {
   static const _bufferSize = 256;
 
+  /// Repaint cadence. Samples arrive at 128-256 Hz; painting on every one
+  /// would starve the UI thread (visibly so on web debug builds), so the
+  /// buffer fills continuously and the canvas refreshes at ~30 fps.
+  static const _repaintInterval = Duration(milliseconds: 33);
+
   final _buffer = ListQueue<double>(_bufferSize);
   StreamSubscription<EegSample>? _sub;
+  Timer? _repaint;
+  bool _dirty = false;
 
   @override
   void initState() {
     super.initState();
     _subscribe();
+    _repaint = Timer.periodic(_repaintInterval, (_) {
+      if (_dirty && mounted) {
+        _dirty = false;
+        setState(() {});
+      }
+    });
   }
 
   @override
   void didUpdateWidget(EegRawWave oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.rawStream != widget.rawStream ||
-        oldWidget.selectedChannel != widget.selectedChannel) {
+    // Only the channel matters: a broadcast controller hands out a new
+    // Stream wrapper on every `stream` access, so comparing streams would
+    // resubscribe (and wipe the buffer) on every parent rebuild.
+    if (oldWidget.selectedChannel != widget.selectedChannel) {
       _sub?.cancel();
       _buffer.clear();
       _subscribe();
@@ -53,12 +68,13 @@ class _EegRawWaveState extends State<EegRawWave> {
         _buffer.removeFirst();
       }
       _buffer.addLast(value);
-      if (mounted) setState(() {});
+      _dirty = true;
     });
   }
 
   @override
   void dispose() {
+    _repaint?.cancel();
     _sub?.cancel();
     super.dispose();
   }

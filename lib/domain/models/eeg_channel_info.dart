@@ -1,3 +1,6 @@
+import '../enums/eeg_device_type.dart';
+import 'eeg_channel_catalog.dart';
+
 class EegChannelInfo {
   final String name;
   final double positionX;
@@ -11,13 +14,10 @@ class EegChannelInfo {
     this.isReference = false,
   });
 
-  static List<EegChannelInfo> emotivInsightChannels() => const [
-        EegChannelInfo(name: 'AF3', positionX: 0.3, positionY: 0.2),
-        EegChannelInfo(name: 'T7', positionX: 0.1, positionY: 0.5),
-        EegChannelInfo(name: 'Pz', positionX: 0.5, positionY: 0.5),
-        EegChannelInfo(name: 'T8', positionX: 0.9, positionY: 0.5),
-        EegChannelInfo(name: 'AF4', positionX: 0.7, positionY: 0.2),
-      ];
+  /// Insight layout. Kept for callers that predate [EegChannelCatalog];
+  /// prefer `EegChannelCatalog.forType(EegDeviceType.emotivInsight)`.
+  static List<EegChannelInfo> emotivInsightChannels() =>
+      EegChannelCatalog.forType(EegDeviceType.emotivInsight);
 
   Map<String, dynamic> toJson() => {
         'name': name,

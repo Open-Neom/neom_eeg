@@ -4,6 +4,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:neom_eeg/domain/enums/eeg_stream_type.dart';
 import 'package:neom_eeg/domain/enums/eeg_connection_state.dart';
 import 'package:neom_eeg/domain/enums/eeg_device_type.dart';
+import 'package:neom_eeg/domain/enums/eeg_vendor.dart';
 
 void main() {
   group('EegStreamType enum', () {
@@ -44,8 +45,32 @@ void main() {
   });
 
   group('EegDeviceType enum', () {
-    test('tiene 8 dispositivos soportados', () {
-      expect(EegDeviceType.values.length, 8);
+    test('tiene 12 modelos soportados', () {
+      expect(EegDeviceType.values.length, 12);
+    });
+
+    test('cada modelo pertenece a un vendor y cada vendor tiene modelos', () {
+      for (final vendor in EegVendor.values) {
+        expect(EegDeviceType.ofVendor(vendor), isNotEmpty,
+            reason: '${vendor.displayName} debería tener al menos un modelo');
+      }
+      expect(EegDeviceType.emotivInsight.vendor, EegVendor.emotiv);
+      expect(EegDeviceType.muse.vendor, EegVendor.interaxon);
+      expect(EegDeviceType.openbciGanglion.vendor, EegVendor.openbci);
+    });
+
+    test('resuelve modelos Emotiv desde ids de Cortex', () {
+      expect(EegDeviceType.fromCortexId('INSIGHT-A1B2C3D4'),
+          EegDeviceType.emotivInsight);
+      expect(EegDeviceType.fromCortexId('EPOCX-E5020A3F'),
+          EegDeviceType.emotivEpocX);
+      expect(EegDeviceType.fromCortexId('EPOCPLUS-3B9AXXXX'),
+          EegDeviceType.emotivEpocPlus);
+      expect(EegDeviceType.fromCortexId('EPOCFLEX-1234'),
+          EegDeviceType.emotivEpocFlex);
+      expect(EegDeviceType.fromCortexId('MN8-0001'), EegDeviceType.emotivMn8);
+      expect(EegDeviceType.fromCortexId('EPOC'), EegDeviceType.emotivEpocX);
+      expect(EegDeviceType.fromCortexId('Muse-1234'), isNull);
     });
 
     test('cada dispositivo tiene channelCount > 0', () {
@@ -55,10 +80,11 @@ void main() {
       }
     });
 
-    test('cada dispositivo tiene sampleRate sano (> 100 Hz)', () {
+    test('cada dispositivo tiene sampleRate sano (>= 125 Hz)', () {
+      // Cyton + Daisy multiplexa 16 canales a 125 Hz; es el mínimo real.
       for (final dev in EegDeviceType.values) {
-        expect(dev.sampleRate, greaterThanOrEqualTo(128),
-            reason: '${dev.displayName} debería muestrear >= 128 Hz');
+        expect(dev.sampleRate, greaterThanOrEqualTo(125),
+            reason: '${dev.displayName} debería muestrear >= 125 Hz');
       }
     });
 

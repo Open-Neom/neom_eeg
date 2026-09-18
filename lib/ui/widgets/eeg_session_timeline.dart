@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../../domain/enums/eeg_device_type.dart';
+import '../../domain/enums/eeg_vendor.dart';
 import '../../domain/models/eeg_session.dart';
 
 /// Timeline list of recorded EEG sessions.
@@ -148,23 +149,13 @@ class _SessionCard extends StatelessWidget {
     );
   }
 
-  IconData _iconForType(EegDeviceType type) {
-    switch (type) {
-      case EegDeviceType.emotivEpocX:
-      case EegDeviceType.emotivInsight:
-      case EegDeviceType.emotivMn8:
-        return Icons.headset;
-      case EegDeviceType.muse:
-        return Icons.self_improvement;
-      case EegDeviceType.neurosky:
-        return Icons.psychology;
-      case EegDeviceType.brainbit:
-      case EegDeviceType.openbci:
-        return Icons.memory;
-      case EegDeviceType.simulated:
-        return Icons.bug_report;
-    }
-  }
+  IconData _iconForType(EegDeviceType type) => switch (type.vendor) {
+        EegVendor.emotiv => Icons.headset,
+        EegVendor.interaxon => Icons.self_improvement,
+        EegVendor.neurosky => Icons.psychology,
+        EegVendor.brainbit || EegVendor.openbci => Icons.memory,
+        EegVendor.simulated => Icons.bug_report,
+      };
 
   String _formatDate(DateTime dt) {
     final months = [

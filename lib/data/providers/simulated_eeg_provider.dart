@@ -3,36 +3,37 @@ import 'dart:math';
 
 import '../../domain/enums/eeg_connection_state.dart';
 import '../../domain/enums/eeg_device_type.dart';
+import '../../domain/enums/eeg_transport.dart';
+import '../../domain/enums/eeg_vendor.dart';
 import '../../domain/models/eeg_band_power.dart';
-import '../../domain/models/eeg_channel_info.dart';
+import '../../domain/models/eeg_capabilities.dart';
+import '../../domain/models/eeg_channel_catalog.dart';
 import '../../domain/models/eeg_device_info.dart';
+import '../../domain/models/eeg_device_status.dart';
 import '../../domain/models/eeg_mental_state.dart';
 import '../../domain/models/eeg_sample.dart';
-import '../../domain/use_cases/eeg_device_service.dart';
+import '../drivers/eeg_driver_base.dart';
 
-/// Mock EEG provider for testing and development.
+/// Mock EEG driver for testing and development.
 ///
 /// Generates realistic alpha rhythm (10 Hz base + noise) with periodic
 /// eye blink artifacts on frontal channels (~every 5 s). Runs at a
 /// simulated 128 Hz sample rate (emits batches of 16 samples per timer).
-class SimulatedEegProvider implements EegDeviceService {
+///
+/// Advertises native band power and metrics so the hub streams what the
+/// simulator produces instead of re-deriving it; pass
+/// `nativeAnalytics: false` to exercise the hub's derivation path.
+class SimulatedEegProvider extends EegDriverBase {
   final double baseAlpha;
   final double baseTheta;
   final double baseBeta;
+  final bool nativeAnalytics;
 
-  EegConnectionState _connectionState = EegConnectionState.disconnected;
-  EegDeviceInfo? _connectedDevice;
   Timer? _sampleTimer;
   Timer? _blinkTimer;
   int _sampleIndex = 0;
   bool _blinkActive = false;
   final _random = Random();
-
-  final _rawController = StreamController<EegSample>.broadcast();
-  final _bandPowerController =
-      StreamController<List<EegBandPower>>.broadcast();
-  final _mentalStateController =
-      StreamController<EegMentalState>.broadcast();
 
   static const _channelNames = ['AF3', 'T7', 'Pz', 'T8', 'AF4'];
   static const _sampleRate = 128;
@@ -42,43 +43,49 @@ class SimulatedEegProvider implements EegDeviceService {
     this.baseAlpha = 12.0,
     this.baseTheta = 6.0,
     this.baseBeta = 4.0,
+    this.nativeAnalytics = true,
   });
 
   @override
-  EegConnectionState get connectionState => _connectionState;
+  EegVendor get vendor => EegVendor.simulated;
 
   @override
-  EegDeviceInfo? get connectedDevice => _connectedDevice;
+  Set<EegDeviceType> get supportedTypes => const {EegDeviceType.simulated};
 
   @override
-  Stream<EegSample> get rawStream => _rawController.stream;
-
-  @override
-  Stream<List<EegBandPower>> get bandPowerStream =>
-      _bandPowerController.stream;
-
-  @override
-  Stream<EegMentalState> get mentalStateStream =>
-      _mentalStateController.stream;
+  EegCapabilities capabilitiesFor(EegDeviceType type) => supports(type)
+      ? EegCapabilities(
+          nativeBandPower: nativeAnalytics,
+          nativeMentalMetrics: nativeAnalytics,
+          contactQuality: true,
+          battery: true,
+          temporalCoverage: true,
+          transports: const {EegTransport.simulated},
+        )
+      : EegCapabilities.none;
 
   @override
   Future<List<EegDeviceInfo>> scan({
     Duration timeout = const Duration(seconds: 10),
   }) async {
-    _connectionState = EegConnectionState.scanning;
+    final previous = connectionState;
+    setConnectionState(EegConnectionState.scanning);
     await Future<void>.delayed(const Duration(seconds: 1));
-    _connectionState = EegConnectionState.disconnected;
+    setConnectionState(
+      previous == EegConnectionState.streaming ? previous : EegConnectionState.disconnected,
+    );
 
     return [
       EegDeviceInfo(
         id: 'sim_001',
         name: 'Simulated EEG',
         type: EegDeviceType.simulated,
-        channels: EegChannelInfo.emotivInsightChannels(),
+        channels: EegChannelCatalog.forType(EegDeviceType.simulated),
         sampleRate: _sampleRate,
         battery: 100,
         signalQuality: 1.0,
         firmwareVersion: '1.0.0-sim',
+        transport: EegTransport.simulated,
       ),
     ];
   }
@@ -89,12 +96,20 @@ class SimulatedEegProvider implements EegDeviceService {
     _sampleTimer?.cancel();
     _blinkTimer?.cancel();
 
-    _connectionState = EegConnectionState.connecting;
-    _connectedDevice = device;
+    setConnectionState(EegConnectionState.connecting);
+    setConnectedDevice(device);
     await Future<void>.delayed(const Duration(milliseconds: 500));
 
-    _connectionState = EegConnectionState.streaming;
+    setConnectionState(EegConnectionState.streaming);
     _sampleIndex = 0;
+
+    emitStatus(EegDeviceStatus(
+      battery: 1.0,
+      wirelessSignal: 1.0,
+      contactQuality: {for (final ch in _channelNames) ch: 1.0},
+      overallQuality: 1.0,
+      timestamp: DateTime.now(),
+    ));
 
     // Emit batches at ~125ms intervals (16 samples at 128Hz)
     _sampleTimer = Timer.periodic(
@@ -115,8 +130,14 @@ class SimulatedEegProvider implements EegDeviceService {
     _blinkTimer?.cancel();
     _sampleTimer = null;
     _blinkTimer = null;
-    _connectedDevice = null;
-    _connectionState = EegConnectionState.disconnected;
+    setConnectedDevice(null);
+    setConnectionState(EegConnectionState.disconnected);
+  }
+
+  @override
+  Future<void> dispose() async {
+    await disconnect();
+    await super.dispose();
   }
 
   // --- Signal generation ---
@@ -137,7 +158,7 @@ class SimulatedEegProvider implements EegDeviceService {
         channels[ch] = value;
       }
 
-      _rawController.add(EegSample(
+      emitRaw(EegSample(
         timestamp: now.add(Duration(
           microseconds: (i * 1000000 / _sampleRate).round(),
         )),
@@ -147,6 +168,8 @@ class SimulatedEegProvider implements EegDeviceService {
 
       _sampleIndex++;
     }
+
+    if (!nativeAnalytics) return;
 
     // Emit band power every batch
     _emitBandPower(now);
@@ -187,11 +210,11 @@ class SimulatedEegProvider implements EegDeviceService {
       );
     }).toList();
 
-    _bandPowerController.add(powers);
+    emitBandPower(powers);
   }
 
   void _emitMentalState(DateTime now) {
-    _mentalStateController.add(EegMentalState(
+    emitMentalState(EegMentalState(
       engagement: 0.5 + _random.nextDouble() * 0.3,
       relaxation: 0.6 + _random.nextDouble() * 0.2,
       stress: 0.2 + _random.nextDouble() * 0.15,

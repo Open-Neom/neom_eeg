@@ -1,0 +1,6 @@
+# `live` tests talk to real hardware / EMOTIV Launcher. They skip themselves
+# without credentials, so plain `flutter test` stays hermetic; run them with:
+#   EMOTIV_CLIENT_ID=… EMOTIV_CLIENT_SECRET=… flutter test test/live --tags live
+tags:
+  live:
+    timeout: 4m
