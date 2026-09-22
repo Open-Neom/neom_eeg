@@ -1,3 +1,23 @@
+## 0.3.0 - 2026-09-22
+
+- `EegCalibration` ampliada (desviaciones, ojos cerrados, reactividad alfa,
+  índices de reposo, `zScore/indexZ/baselineAsymmetry/bandShares/baselineFrame`,
+  clave `subjectId|modelo`); JSON anterior compatible.
+- `EegCalibrationBuilder` (Welford por banda/canal, raw DC + ruido) y
+  `EegCalibrationController` (rutina ojos abiertos/cerrados con cuenta
+  regresiva, Hive `eeg_calibrations`, carga automática al conectar).
+  `EegCalibrationPanel` + `showEegCalibrationSheet` en el dashboard.
+- `EegIndices` / `EegLiveIndices`: shares, asimetría sobre el mejor par,
+  activación frontal β/(α+θ), share alfa posterior, z-scores e
+  hipofrontalidad con calibración. `EegChannelCatalog.regionOf/isFrontal/
+  isPosterior/isTemporal`.
+- `EegWatchRule` / `EegAlert` / `EegWatchController`: reglas con sustain y
+  cooldown, umbrales personales, markers automáticos en `hub.recording`,
+  notas en la captura (`EegSessionCapture.alerts`, `EegAlertNote`),
+  `EegWatchStrip` en el dashboard, avisos en el reporte.
+- `EegSessionCapture.entrainmentIndex(banda)` y `bandShareAt`; tiles
+  "Entrainment alfa/theta" y "Avisos" en `EegSessionReportPage`.
+
 ## 0.2.0
 
 - Root CA de Emotiv pinneada en el transporte WebSocket (de

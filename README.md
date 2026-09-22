@@ -362,6 +362,61 @@ duración, micrófono, bandas por segundo, coherencia, métricas promedio,
 marcadores y contacto, cobertura (muestras recibidas ÷ esperadas). Se abre
 desde el drawer del `EegMonitorPage`.
 
+## Línea base personal y vigilante de umbrales
+
+Casi todo lo que Cyberneom pide al EEG (modo CARE, pre-ictal,
+hipofrontalidad, entrainment) necesita comparar la señal con **la del propio
+sujeto**, no con valores fijos. Dos piezas agnósticas lo resuelven:
+
+**`EegCalibrationController`** corre la rutina de reposo sobre el headset
+conectado — 60 s ojos abiertos mirando un punto fijo, 30 s ojos cerrados —
+y produce una `EegCalibration` por `subjectId|modelo` (Hive, caja
+`eeg_calibrations`): media y desviación por banda y canal (Welford, sin
+historial), nivel DC y ruido del raw (`noiseFloor`, `artifactThreshold`),
+medias con ojos cerrados y la **reactividad alfa** (alfa cerrado ÷ alfa
+abierto sobre electrodos posteriores; sana ≈ 1.5–3×, ≈ 1 delata mal
+contacto), e índices de reposo (`frontalActivation`, `asymmetry:<banda>`).
+`zScore(banda, valor)`, `indexZ`, `baselineAsymmetry`, `bandShares`,
+`baselineFrame`, `isStale()`. El JSON antiguo (`baselines/noiseFloor/
+artifactThreshold/calibratedAt`) sigue cargando. UI: `EegCalibrationPanel`
+(estado + botón) y `showEegCalibrationSheet` (cuenta regresiva por fase y
+resumen); el `subjectId` lo da el host (`() => profile.id`).
+
+**`EegIndices`** define una vez los números que todo lo demás usa:
+`shares` por banda, `asymmetry` sobre el mejor par (`EegChannelCatalog.
+bestPair`), `frontalActivation` = β/(α+θ) en electrodos prefrontales/
+frontales (índice de Pope 1995 restringido a frontal), `posteriorAlphaShare`,
+y `compute(frame, calibration:)` → `EegLiveIndices` con z-scores,
+`frontalActivationZ` e **hipofrontalidad** `(reposo − actual)/reposo` en
+`0..1`. `EegChannelCatalog.regionOf/isFrontal/isPosterior` clasifican
+cualquier etiqueta 10-20, así que funciona igual en Insight (AF3/AF4 + Pz),
+Muse (AF7/AF8) o Ganglion (Fp1/Fp2 + O1/O2).
+
+**`EegWatchController`** evalúa `EegWatchRule`s (datos, JSON) contra cada
+frame: métrica (`asymmetry`, `coherence`, `bandZ`, `bandShare`,
+`frontalActivation`, `frontalActivationZ`, `excludedChannels`), umbral,
+dirección, **`sustain`** (la condición debe mantenerse N s) y `cooldown`
+(un episodio largo se re-marca cada N s, no cada frame). Reglas por
+defecto: asimetría sostenida 10 s (personal: distancia a la asimetría de
+reposo cuando hay calibración), beta > 2σ 10 s, alfa > 1σ 20 s (info: el
+objetivo se sostiene), activación frontal < −1σ 20 s (hipofrontalidad),
+electrodo sin contacto 5 s. Las reglas por desviación duermen sin
+calibración (`isArmed`). Al dispararse: `EegAlert` en `alertStream`/
+`alerts`, **marker automático** en `hub.recording` si hay grabación
+(`autoMarkers`), y nota en la captura abierta (`EegSessionCapture.alerts`,
+visible en el reporte). `indices`, `active` y `holding` alimentan
+`EegWatchStrip` (chips en vivo, progreso de sustain, últimos avisos,
+switch de markers). `EegSessionCapture.entrainmentIndex(banda)` = share de
+la banda en el último tercio ÷ primer tercio, en el reporte como
+"Entrainment alfa/theta".
+
+Ambos son opt-in: el dashboard muestra sus paneles sólo si el host registró
+los controllers. Cyberneom los registra en `root_binding.dart` y los
+despierta desde `CyberneomEegPracticeBridge` para que vigilen aunque el
+panel EEG esté cerrado; además publica `CyberneomEegVisualSignal`
+(`NeomAudioSessionSignal`) — la señal de la Cámara con `hemisphericCoherence`
+medida por el EEG cuando hay headset — sin tocar el generador.
+
 ## Electrodos sin contacto
 
 Un sensor sin punta (o levantado) sigue apareciendo en `eeg`/`pow` como ruido;
@@ -374,7 +429,7 @@ El raw no se filtra — cada `EegSample.quality` trae la CQ por canal.
 ## Tests
 
 ```bash
-flutter test                       # 192 tests, sin hardware
+flutter test                       # 296 tests, sin hardware
 ```
 
 ### Prueba en vivo con un headset real

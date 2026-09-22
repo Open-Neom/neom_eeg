@@ -71,6 +71,7 @@ export 'domain/models/eeg_asymmetry.dart';
 export 'domain/models/eeg_exceptions.dart';
 export 'domain/models/eeg_recording.dart';
 export 'domain/models/eeg_session_capture.dart';
+export 'domain/models/eeg_watch_rule.dart';
 export 'domain/models/emotiv_cortex_config.dart';
 
 // ═══════════════════════════════════════════════════════════════
@@ -115,6 +116,10 @@ export 'data/implementations/eeg_biofeedback_adapter.dart';
 export 'data/implementations/eeg_session_recorder.dart';
 export 'data/implementations/local_eeg_recording_service.dart';
 export 'data/implementations/eeg_session_capture_controller.dart';
+export 'data/implementations/eeg_indices.dart';
+export 'data/implementations/eeg_calibration_builder.dart';
+export 'data/implementations/eeg_calibration_controller.dart';
+export 'data/implementations/eeg_watch_controller.dart';
 export 'data/implementations/eeg_practice_link.dart';
 export 'data/implementations/eeg_neurofeedback_controller.dart';
 export 'data/implementations/eeg_neuro_state_adapter.dart';
@@ -131,6 +136,8 @@ export 'ui/widgets/eeg_contact_quality_strip.dart';
 export 'ui/widgets/eeg_hemispheric_balance.dart';
 export 'ui/widgets/eeg_metrics_row.dart';
 export 'ui/widgets/eeg_recording_strip.dart';
+export 'ui/widgets/eeg_calibration_panel.dart';
+export 'ui/widgets/eeg_watch_strip.dart';
 export 'ui/widgets/eeg_band_meter.dart';
 export 'ui/widgets/eeg_topography.dart';
 export 'ui/widgets/eeg_raw_wave.dart';

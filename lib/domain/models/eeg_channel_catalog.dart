@@ -234,6 +234,58 @@ class EegChannelCatalog {
     return pairs.isEmpty ? null : pairs.first;
   }
 
+  /// Cortical region of a 10-20 label, from its letter prefix: `AF3` →
+  /// `prefrontal`, `F7` → `frontal`, `FC5` → `frontocentral`, `T7` →
+  /// `temporal`, `Pz` → `parietal`, `O1` → `occipital`… Legacy names
+  /// resolve through their 10-10 alias. Null for labels that are not
+  /// 10-20 positions (`RAW_CQ`, a Flex custom name).
+  static String? regionOf(String label) {
+    final u = label.toUpperCase();
+    final canonical = _legacyAlias[u] ?? u;
+    final match = RegExp(r'^[A-Z]+').firstMatch(canonical);
+    if (match == null) return null;
+    // 'FP' would otherwise be read as frontal + a stray P; 'PZ' has no
+    // number, so the prefix is the whole label minus the midline Z.
+    var prefix = match.group(0)!;
+    if (prefix.length > 1 && prefix.endsWith('Z')) {
+      prefix = prefix.substring(0, prefix.length - 1);
+    }
+    return _regionByPrefix[prefix];
+  }
+
+  static const Map<String, String> _regionByPrefix = {
+    'FP': 'prefrontal',
+    'AF': 'prefrontal',
+    'F': 'frontal',
+    'FT': 'frontotemporal',
+    'FC': 'frontocentral',
+    'T': 'temporal',
+    'C': 'central',
+    'TP': 'temporoparietal',
+    'CP': 'centroparietal',
+    'P': 'parietal',
+    'PO': 'parieto-occipital',
+    'O': 'occipital',
+  };
+
+  /// Prefrontal and frontal electrodes — where the "analytic processor"
+  /// the hypofrontality protocol wants to quiet is read (AF3/AF4 on an
+  /// Insight, AF7/AF8 on a Muse or MN8, Fp1 on a MindWave).
+  static bool isFrontal(String label) {
+    final r = regionOf(label);
+    return r == 'prefrontal' || r == 'frontal';
+  }
+
+  /// Parietal and occipital electrodes, where resting alpha is strongest
+  /// and eyes-closed reactivity is measured (Pz on an Insight, O1/O2 on
+  /// BrainBit and Ganglion).
+  static bool isPosterior(String label) {
+    final r = regionOf(label);
+    return r == 'parietal' || r == 'parieto-occipital' || r == 'occipital';
+  }
+
+  static bool isTemporal(String label) => regionOf(label) == 'temporal';
+
   /// Whether a channel set covers the temporal lobes (T7/T8 or the
   /// mastoid-adjacent TP9/TP10), which the Cyberneom epilepsy protocol
   /// relies on for hemispheric asymmetry.

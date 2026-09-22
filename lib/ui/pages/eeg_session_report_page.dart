@@ -65,7 +65,7 @@ class EegSessionReportPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 12),
                 _Section(
-                  title: 'MARCADORES Y CONTACTO',
+                  title: 'MARCADORES, AVISOS Y CONTACTO',
                   icon: Icons.flag,
                   child: _Events(capture: c),
                 ),
@@ -142,6 +142,19 @@ class _SummaryTiles extends StatelessWidget {
         Colors.white,
       ),
       ('Marcadores', '${c.markers.length}', Colors.white),
+      if (c.alerts.isNotEmpty) ('Avisos', '${c.alerts.length}', Colors.amber),
+      if (c.entrainmentIndex('alpha') != null)
+        (
+          'Entrainment alfa',
+          _ratio(c.entrainmentIndex('alpha')!),
+          c.entrainmentIndex('alpha')! >= 1.1
+              ? Colors.greenAccent
+              : c.entrainmentIndex('alpha')! <= 0.9
+                  ? Colors.amber
+                  : Colors.white,
+        ),
+      if (c.entrainmentIndex('theta') != null)
+        ('Entrainment theta', _ratio(c.entrainmentIndex('theta')!), Colors.white),
     ];
     return Wrap(
       spacing: 8,
@@ -445,8 +458,8 @@ class _Events extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = capture;
-    if (c.markers.isEmpty && c.contactChanges.isEmpty) {
-      return const Text('Sin marcadores ni cambios de contacto',
+    if (c.markers.isEmpty && c.contactChanges.isEmpty && c.alerts.isEmpty) {
+      return const Text('Sin marcadores, avisos ni cambios de contacto',
           style: TextStyle(color: Colors.white38, fontSize: 12));
     }
     final startMs = c.startedAt.millisecondsSinceEpoch;
@@ -459,6 +472,19 @@ class _Events extends StatelessWidget {
             color: Colors.amber,
             time: _mmss(((m.at.millisecondsSinceEpoch - startMs) / 1000).round().clamp(0, 1 << 30)),
             text: '${m.label} (${m.value})${m.extras.isEmpty ? '' : ' · ${m.extras}'}',
+          ),
+        for (final a in c.alerts)
+          _EventRow(
+            icon: a.markerAdded ? Icons.notifications_active : Icons.notifications_none,
+            color: a.severity == 'critical'
+                ? Colors.redAccent
+                : a.severity == 'warning'
+                    ? Colors.amber
+                    : Colors.lightBlueAccent,
+            time: _mmss(a.t.round()),
+            text: '${a.label} · ${a.value.toStringAsFixed(2)} vs ${a.threshold.toStringAsFixed(2)} · '
+                'sostenido ${a.sustainedSeconds.round()} s'
+                '${a.markerAdded ? ' · marcado' : ''}',
           ),
         for (final cc in c.contactChanges)
           _EventRow(
@@ -587,6 +613,9 @@ class _Tag extends StatelessWidget {
 String _two(int v) => v.toString().padLeft(2, '0');
 
 String _mmss(int seconds) => '${_two(seconds ~/ 60)}:${_two(seconds % 60)}';
+
+/// Share at the end ÷ share at the start, shown as a change: ×1.30 = +30 %.
+String _ratio(double r) => '${r >= 1 ? '+' : '−'}${((r - 1).abs() * 100).round()}%';
 
 String _thousands(int n) {
   final s = n.toString();

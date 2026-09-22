@@ -195,6 +195,52 @@ class EegContactChange {
       );
 }
 
+/// A watch rule that fired at second [t] — kept in the capture even when
+/// no recording was active to receive the marker.
+class EegAlertNote {
+  final double t;
+  final String ruleId;
+  final String label;
+  final String severity;
+  final double value;
+  final double threshold;
+  final double sustainedSeconds;
+  final bool markerAdded;
+
+  const EegAlertNote({
+    required this.t,
+    required this.ruleId,
+    required this.label,
+    required this.severity,
+    required this.value,
+    required this.threshold,
+    required this.sustainedSeconds,
+    this.markerAdded = false,
+  });
+
+  Map<String, dynamic> toJson() => {
+        't': t,
+        'ruleId': ruleId,
+        'label': label,
+        'severity': severity,
+        'value': value,
+        'threshold': threshold,
+        'sustainedSeconds': sustainedSeconds,
+        'markerAdded': markerAdded,
+      };
+
+  factory EegAlertNote.fromJson(Map<String, dynamic> j) => EegAlertNote(
+        t: (j['t'] as num).toDouble(),
+        ruleId: j['ruleId'] as String,
+        label: j['label'] as String? ?? j['ruleId'] as String,
+        severity: j['severity'] as String? ?? 'warning',
+        value: (j['value'] as num?)?.toDouble() ?? 0,
+        threshold: (j['threshold'] as num?)?.toDouble() ?? 0,
+        sustainedSeconds: (j['sustainedSeconds'] as num?)?.toDouble() ?? 0,
+        markerAdded: j['markerAdded'] as bool? ?? false,
+      );
+}
+
 /// A pair of frequencies the host used, with how long.
 class EegFrequencyUse {
   final double baseHz;
@@ -230,6 +276,7 @@ class EegSessionCapture {
   final List<EegVoiceEvent> voice;
   final List<EegMarker> markers;
   final List<EegContactChange> contactChanges;
+  final List<EegAlertNote> alerts;
 
   const EegSessionCapture({
     required this.id,
@@ -245,6 +292,7 @@ class EegSessionCapture {
     this.voice = const [],
     this.markers = const [],
     this.contactChanges = const [],
+    this.alerts = const [],
   });
 
   Duration get duration => endedAt.difference(startedAt);
@@ -368,6 +416,41 @@ class EegSessionCapture {
             v.frequencyHz!,
       ];
 
+  /// Share of [band] in the whole-head total at second [t]; null for a
+  /// second without frames.
+  double? bandShareAt(EegCaptureRow r, String band) {
+    if (r.frames == 0 || r.total <= 0) return null;
+    final v = switch (band) {
+      'delta' => r.delta,
+      'theta' => r.theta,
+      'alpha' => r.alpha,
+      'beta' => r.beta,
+      'betaLow' => r.betaLow,
+      'betaHigh' => r.betaHigh,
+      'gamma' => r.gamma,
+      _ => 0.0,
+    };
+    return v / r.total;
+  }
+
+  /// Did the session move the spectrum towards [band]? Mean share of the
+  /// band over the last third of the session ÷ over the first third. 1.0 =
+  /// unchanged; 1.3 = 30 % more of the spectrum in the target band at the
+  /// end than at the start. Null when either third has no frames.
+  double? entrainmentIndex(String band) {
+    final withFrames = rows.where((r) => r.frames > 0).toList();
+    if (withFrames.length < 6) return null;
+    final third = withFrames.length ~/ 3;
+    double? avg(Iterable<EegCaptureRow> part) {
+      final v = [for (final r in part) if (bandShareAt(r, band) != null) bandShareAt(r, band)!];
+      return v.isEmpty ? null : v.reduce((a, b) => a + b) / v.length;
+    }
+    final start = avg(withFrames.take(third));
+    final end = avg(withFrames.skip(withFrames.length - third));
+    if (start == null || end == null || start <= 0) return null;
+    return end / start;
+  }
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'practiceSessionId': practiceSessionId,
@@ -382,6 +465,7 @@ class EegSessionCapture {
         'voice': voice.map((v) => v.toJson()).toList(),
         'markers': markers.map((m) => m.toJson()).toList(),
         'contactChanges': contactChanges.map((c) => c.toJson()).toList(),
+        'alerts': alerts.map((a) => a.toJson()).toList(),
       };
 
   factory EegSessionCapture.fromJson(Map<String, dynamic> j) => EegSessionCapture(
@@ -412,6 +496,10 @@ class EegSessionCapture {
         contactChanges: [
           for (final c in (j['contactChanges'] as List?) ?? const [])
             EegContactChange.fromJson(Map<String, dynamic>.from(c as Map)),
+        ],
+        alerts: [
+          for (final a in (j['alerts'] as List?) ?? const [])
+            EegAlertNote.fromJson(Map<String, dynamic>.from(a as Map)),
         ],
       );
 }

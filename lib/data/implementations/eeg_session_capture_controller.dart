@@ -13,6 +13,7 @@ import '../../domain/models/eeg_mental_state.dart';
 import '../../domain/models/eeg_recording.dart';
 import '../../domain/models/eeg_sample.dart';
 import '../../domain/models/eeg_session_capture.dart';
+import '../../domain/models/eeg_watch_rule.dart';
 import '../../domain/use_cases/eeg_recording_service.dart';
 import '../hub/eeg_hub.dart';
 
@@ -213,6 +214,23 @@ class EegSessionCaptureController extends SintController {
     seg.voice.add(EegVoiceEvent(t: _elapsed(seg), kind: kind, frequencyHz: frequencyHz));
   }
 
+  /// Records a watch alert in the open segment. The watcher calls this so
+  /// the report shows what fired even when no recording took the marker.
+  void noteAlert(EegAlert alert) {
+    final seg = _segment;
+    if (seg == null) return;
+    seg.alerts.add(EegAlertNote(
+      t: alert.firedAt.difference(seg.startedAt).inMilliseconds / 1000.0,
+      ruleId: alert.rule.id,
+      label: alert.rule.label,
+      severity: alert.severity.name,
+      value: alert.value,
+      threshold: alert.threshold,
+      sustainedSeconds: alert.sustained.inMilliseconds / 1000.0,
+      markerAdded: alert.markerAdded,
+    ));
+  }
+
   /// Closes the open segment, persists it and returns it. Returns null when
   /// nothing was open or the segment holds neither EEG nor markers.
   Future<EegSessionCapture?> endSegment({DateTime? endedAt}) async {
@@ -238,7 +256,7 @@ class EegSessionCaptureController extends SintController {
     // Seconds with no samples are kept inside a capture (they show the
     // gaps), but a segment that never saw the headset is not worth saving.
     final hasSignal = rows.any((r) => r.samples > 0 || r.frames > 0);
-    if (!hasSignal && seg.markers.isEmpty) return null;
+    if (!hasSignal && seg.markers.isEmpty && seg.alerts.isEmpty) return null;
 
     final device = seg.device ?? hub.connectedDevice;
     final capture = EegSessionCapture(
@@ -257,6 +275,7 @@ class EegSessionCaptureController extends SintController {
       voice: List.of(seg.voice),
       markers: List.of(seg.markers),
       contactChanges: List.of(seg.contactChanges),
+      alerts: List.of(seg.alerts),
     );
     await _save(capture);
     return capture;
@@ -489,6 +508,7 @@ class _Segment {
   final voice = <EegVoiceEvent>[];
   final markers = <EegMarker>[];
   final contactChanges = <EegContactChange>[];
+  final alerts = <EegAlertNote>[];
   List<String> lastExcluded;
 
   _Segment({
