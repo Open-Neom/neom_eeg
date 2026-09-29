@@ -128,7 +128,7 @@ void main() {
   });
 
   group('segments', () {
-    test('cut a capture with EEG, coherence, metrics, context, voice, markers',
+    test('cut a capture with EEG, symmetry, metrics, context, voice, markers',
         () async {
       await connectInsight();
       var base = 432.0;
@@ -147,9 +147,9 @@ void main() {
         engagement: 0.5, relaxation: 0.8, stress: 0.2, focus: 0.6, excitement: 0.3,
         timestamp: DateTime.now(),
       ));
-      pushSecondOfData(t7: 10, t8: 10); // balanced → coherence 1
+      pushSecondOfData(t7: 10, t8: 10); // balanced → symmetry 1
       await ticks(1);
-      pushSecondOfData(t7: 30, t8: 10); // asymmetric → coherence 0.5
+      pushSecondOfData(t7: 30, t8: 10); // asymmetric → symmetry 0.5
       capture.noteVoice(EegVoiceEventKind.captureStarted);
       capture.noteVoice(EegVoiceEventKind.detected, frequencyHz: 214.5);
       base = 528.0;
@@ -172,8 +172,10 @@ void main() {
       expect(cap.rows.length, greaterThanOrEqualTo(2));
       expect(cap.sampleCount, 256);
       expect(cap.frameCount, 16);
-      expect(cap.rows.first.coherence, closeTo(1.0, 1e-9));
-      expect(cap.rows.where((r) => r.frames > 0).last.coherence, closeTo(0.5, 1e-9));
+      expect(cap.rows.first.symmetry, closeTo(1.0, 1e-9));
+      expect(cap.rows.where((r) => r.frames > 0).last.symmetry, closeTo(0.5, 1e-9));
+      // No raw EEG went through the hub: no spectral coherence is claimed.
+      expect(cap.rows.every((r) => r.coherence == null), isTrue);
       expect(cap.rows.first.relaxation, 0.8);
       expect(cap.avgBands['alpha'], greaterThan(0));
       expect(cap.dominantBand, 'alpha');
@@ -196,7 +198,7 @@ void main() {
       // JSON round trip keeps the numbers.
       final again = EegSessionCapture.fromJson(cap.toJson());
       expect(again.sampleCount, cap.sampleCount);
-      expect(again.rows.first.coherence, cap.rows.first.coherence);
+      expect(again.rows.first.symmetry, cap.rows.first.symmetry);
       expect(again.frequenciesUsed.length, used.length);
       expect(again.markers.single.label, 'aura');
     });
@@ -378,6 +380,66 @@ void main() {
           ),
       ];
       expect(rows.every((r) => r.dominantBand == 'alpha'), isTrue);
+    });
+  });
+
+  group('frequency-following response', () {
+    /// [seconds] of raw EEG with a 6 Hz component of [amplitude] µV on
+    /// every channel over ±5 µV noise, delivered as fast as possible.
+    Future<void> pushRaw({required int seconds, double amplitude = 3}) async {
+      final rnd = Random(4);
+      double g() => sqrt(-2 * log(1 - rnd.nextDouble())) * cos(2 * pi * rnd.nextDouble());
+      for (var i = 0; i < seconds * 128; i++) {
+        final v = amplitude * sin(2 * pi * 6 * i / 128);
+        emotiv.raw(EegSample(
+          timestamp: DateTime.now(),
+          channels: {for (final ch in ['AF3', 'T7', 'Pz', 'T8', 'AF4']) ch: 4200 + v + 5 * g()},
+          quality: const {},
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    test('measures the response at the beat the host is playing', () async {
+      await connectInsight();
+      await capture.startSegment(
+        practiceSessionId: 'practice_ffr',
+        contextSampler: () => {EegContextKeys.baseHz: 200.0, EegContextKeys.beatHz: 6.0},
+      );
+      await pushRaw(seconds: 9);
+      await ticks(2);
+      final cap = (await capture.endSegment())!;
+      final ffr = cap.frequencyFollowing;
+      expect(ffr, isNotNull);
+      expect(ffr!.hz, 6.0);
+      expect(ffr.meanSnr, greaterThan(2));
+    });
+
+    test('no stimulus with a beat or pulse, no response is claimed', () async {
+      await connectInsight();
+      await capture.startSegment(
+        practiceSessionId: 'practice_plain',
+        contextSampler: () => {EegContextKeys.baseHz: 432.0, EegContextKeys.beatHz: 0.0},
+      );
+      await pushRaw(seconds: 9);
+      await ticks(2);
+      final cap = (await capture.endSegment())!;
+      expect(cap.frequencyFollowing, isNull);
+    });
+
+    test('an isochronic pulse takes precedence over the binaural beat', () async {
+      await connectInsight();
+      await capture.startSegment(
+        practiceSessionId: 'practice_iso',
+        contextSampler: () => {
+          EegContextKeys.beatHz: 10.0,
+          EegContextKeys.isochronicHz: 6.0,
+        },
+      );
+      await pushRaw(seconds: 9);
+      await ticks(2);
+      final cap = (await capture.endSegment())!;
+      expect(cap.frequencyFollowing!.hz, 6.0);
     });
   });
 }

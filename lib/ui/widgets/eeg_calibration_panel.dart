@@ -24,11 +24,9 @@ class EegCalibrationPanel extends StatelessWidget {
       final cal = controller.current.value;
       final running = controller.isRunning;
       final phase = controller.phase.value;
-      final color = cal == null
+      final color = cal == null || cal.isStale() || !cal.supportsZ
           ? Colors.amber
-          : cal.isStale()
-              ? Colors.amber
-              : Colors.greenAccent;
+          : Colors.greenAccent;
 
       return Container(
         padding: EdgeInsets.all(compact ? 8 : 12),
@@ -97,10 +95,14 @@ class EegCalibrationPanel extends StatelessWidget {
   }
 
   static String _summary(EegCalibration cal) {
+    if (!cal.supportsZ) {
+      return 'Formato anterior (potencia lineal): recalibra para activar las reglas personales.';
+    }
     final parts = <String>[_age(cal.age)];
     final react = cal.alphaReactivity;
     if (react != null) parts.add('reactividad alfa ${react.toStringAsFixed(1)}×');
     parts.add('${cal.channels.length} canales');
+    if (cal.rejectedFrames > 0) parts.add('${cal.rejectedFrames} frames con artefactos descartados');
     if (cal.isStale()) parts.add('conviene repetirla');
     return parts.join(' · ');
   }
@@ -428,6 +430,7 @@ class _Result extends StatelessWidget {
     final react = cal.alphaReactivity;
     final tiles = <(String, String, Color?)>[
       ('Frames', '${cal.frames}', null),
+      if (cal.rejectedFrames > 0) ('Artefactos', '${cal.rejectedFrames}', Colors.amber),
       ('Canales', '${cal.channels.length}', null),
       if (react != null)
         (

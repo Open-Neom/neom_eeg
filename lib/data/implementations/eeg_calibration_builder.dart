@@ -20,64 +20,57 @@ enum EegCalibrationPhase {
   cancelled,
 }
 
-/// Accumulates band-power frames and raw samples per phase and turns them
-/// into an [EegCalibration]. Pure Dart, streaming (Welford) statistics, so
-/// it holds no history and a 90 s routine costs nothing.
+/// Collects the band-power frames of each phase and the raw samples of the
+/// eyes-open phase, then turns them into an [EegCalibration].
+///
+/// Frames are kept (a 90 s routine at 8 Hz is ~700 frames) because the
+/// statistics need two passes:
+///
+/// 1. **Artifact rejection** — a frame is dropped when any electrode's log
+///    total power is more than [rejectZ] robust σ (median/MAD) from that
+///    electrode's median: blinks, jaw clenches, a touched sensor.
+/// 2. **Statistics in log₁₀ power** per band and channel, then the spread of
+///    the channel-averaged z across frames ([EegCalibration.headDeviations]),
+///    so a whole-head z is in real σ.
 class EegCalibrationBuilder {
-  final _open = <String, Map<String, _Welford>>{};
-  final _closed = <String, Map<String, _Welford>>{};
+  /// Robust z beyond which a frame counts as an artifact.
+  final double rejectZ;
+
+  EegCalibrationBuilder({this.rejectZ = 3.5});
+
+  final _open = <List<EegBandPower>>[];
+  final _closed = <List<EegBandPower>>[];
   final _raw = <String, _Welford>{};
-  final _indices = <String, _Welford>{};
-  int _openFrames = 0;
-  int _closedFrames = 0;
   int _rawSamples = 0;
 
-  int get eyesOpenFrames => _openFrames;
-  int get eyesClosedFrames => _closedFrames;
+  int get eyesOpenFrames => _open.length;
+  int get eyesClosedFrames => _closed.length;
   int get rawSamples => _rawSamples;
 
-  /// Channels seen so far in the eyes-open phase.
-  List<String> get channels => (_open['alpha']?.keys ?? const Iterable<String>.empty()).toList();
+  /// Channels seen in the eyes-open phase, in first-seen order.
+  List<String> get channels {
+    final out = <String>[];
+    for (final f in _open) {
+      for (final b in f) {
+        if (!out.contains(b.channel)) out.add(b.channel);
+      }
+    }
+    return out;
+  }
 
   void addFrame(EegCalibrationPhase phase, List<EegBandPower> frame) {
     if (frame.isEmpty) return;
-    final table = switch (phase) {
-      EegCalibrationPhase.eyesOpen => _open,
-      EegCalibrationPhase.eyesClosed => _closed,
-      _ => null,
-    };
-    if (table == null) return;
-
-    for (final b in frame) {
-      for (final band in EegCalibration.bands) {
-        table.putIfAbsent(band, () => {}).putIfAbsent(b.channel, _Welford.new).add(
-              EegIndices.bandValue(b, band),
-            );
-      }
-    }
-
-    if (phase == EegCalibrationPhase.eyesOpen) {
-      _openFrames++;
-      final fa = EegIndices.frontalActivation(frame);
-      if (fa != null) {
-        _indices.putIfAbsent(EegCalibration.frontalActivationIndex, _Welford.new).add(fa);
-      }
-      for (final band in const ['alpha', 'theta', 'beta']) {
-        final asym = EegIndices.asymmetry(frame, band: band);
-        if (asym != null) {
-          _indices
-              .putIfAbsent('${EegCalibration.asymmetryIndexPrefix}$band', _Welford.new)
-              .add(asym.index);
-        }
-      }
-    } else {
-      _closedFrames++;
+    switch (phase) {
+      case EegCalibrationPhase.eyesOpen:
+        _open.add(List.of(frame));
+      case EegCalibrationPhase.eyesClosed:
+        _closed.add(List.of(frame));
+      default:
+        break;
     }
   }
 
-  /// Raw samples feed the DC level and noise floor per channel. Only the
-  /// eyes-open phase is used; blinks are absent there by instruction and
-  /// the eyes-closed phase adds nothing to the noise estimate.
+  /// Raw samples feed the DC level and noise floor per channel (eyes open).
   void addRaw(EegCalibrationPhase phase, EegSample sample) {
     if (phase != EegCalibrationPhase.eyesOpen) return;
     _rawSamples++;
@@ -87,7 +80,35 @@ class EegCalibrationBuilder {
     }
   }
 
-  bool get hasData => _openFrames > 0;
+  bool get hasData => _open.isNotEmpty;
+
+  /// Frames of [frames] that are not artifacts.
+  List<List<EegBandPower>> clean(List<List<EegBandPower>> frames) {
+    if (frames.length < 5) return frames;
+    // Per-channel median and MAD of log total power.
+    final byChannel = <String, List<double>>{};
+    for (final f in frames) {
+      for (final b in f) {
+        byChannel.putIfAbsent(b.channel, () => []).add(EegCalibration.log10(b.totalPower));
+      }
+    }
+    final median = <String, double>{};
+    final mad = <String, double>{};
+    for (final e in byChannel.entries) {
+      final m = _median(e.value);
+      median[e.key] = m;
+      mad[e.key] = _median([for (final v in e.value) (v - m).abs()]) * 1.4826;
+    }
+    return [
+      for (final f in frames)
+        if (!f.any((b) {
+          final s = mad[b.channel] ?? 0;
+          if (s <= 1e-9) return false;
+          return (EegCalibration.log10(b.totalPower) - median[b.channel]!).abs() / s > rejectZ;
+        }))
+          f,
+    ];
+  }
 
   EegCalibration build({
     String? subjectId,
@@ -97,26 +118,88 @@ class EegCalibrationBuilder {
     DateTime? at,
   }) {
     final now = at ?? DateTime.now();
-    final baselines = <String, Map<String, double>>{
-      for (final e in _open.entries)
-        e.key: {for (final c in e.value.entries) c.key: c.value.mean},
-    };
-    final deviations = <String, Map<String, double>>{
-      for (final e in _open.entries)
-        e.key: {for (final c in e.value.entries) c.key: c.value.sd},
-    };
-    if (_raw.isNotEmpty) {
-      baselines[EegCalibration.rawKey] = {for (final e in _raw.entries) e.key: e.value.mean};
-      deviations[EegCalibration.rawKey] = {for (final e in _raw.entries) e.key: e.value.sd};
+    final open = clean(_open);
+    final closed = clean(_closed);
+
+    // Linear and log statistics per band and channel.
+    final linMean = <String, Map<String, double>>{};
+    final linSd = <String, Map<String, double>>{};
+    final logMean = <String, Map<String, double>>{};
+    final logSd = <String, Map<String, double>>{};
+    for (final band in EegCalibration.statBands) {
+      final lin = <String, _Welford>{};
+      final lg = <String, _Welford>{};
+      for (final f in open) {
+        for (final b in f) {
+          final v = EegIndices.bandValue(b, band);
+          lin.putIfAbsent(b.channel, _Welford.new).add(v);
+          lg.putIfAbsent(b.channel, _Welford.new).add(EegCalibration.log10(v));
+        }
+      }
+      if (band != 'beta') {
+        linMean[band] = {for (final e in lin.entries) e.key: e.value.mean};
+        linSd[band] = {for (final e in lin.entries) e.key: e.value.sd};
+      }
+      logMean[band] = {for (final e in lg.entries) e.key: e.value.mean};
+      logSd[band] = {for (final e in lg.entries) e.key: e.value.sd};
     }
-    final eyesClosed = <String, Map<String, double>>{
-      for (final e in _closed.entries)
-        e.key: {for (final c in e.value.entries) c.key: c.value.mean},
-    };
+
+    // Spread of the channel-averaged z at rest, per band.
+    final headSd = <String, double>{};
+    for (final band in EegCalibration.statBands) {
+      final avgZ = _Welford();
+      for (final f in open) {
+        var sum = 0.0;
+        var n = 0;
+        for (final b in f) {
+          final m = logMean[band]![b.channel];
+          final s = logSd[band]![b.channel];
+          if (m == null || s == null || s <= 1e-9) continue;
+          sum += (EegCalibration.log10(EegIndices.bandValue(b, band)) - m) / s;
+          n++;
+        }
+        if (n > 0) avgZ.add(sum / n);
+      }
+      if (avgZ.n >= 2) headSd[band] = avgZ.sd;
+    }
+
+    // Whole-head indices at rest.
+    final indices = <String, _Welford>{};
+    for (final f in open) {
+      final fa = EegIndices.frontalActivation(f);
+      if (fa != null && fa > 0) {
+        indices
+            .putIfAbsent(EegCalibration.frontalActivationIndex, _Welford.new)
+            .add(EegCalibration.log10(fa));
+      }
+      for (final band in const ['alpha', 'theta', 'beta']) {
+        final asym = EegIndices.asymmetry(f, band: band);
+        if (asym != null) {
+          indices
+              .putIfAbsent('${EegCalibration.asymmetryIndexPrefix}$band', _Welford.new)
+              .add(asym.index);
+        }
+      }
+    }
+
+    final closedMean = <String, Map<String, double>>{};
+    for (final band in EegCalibration.bands) {
+      final w = <String, _Welford>{};
+      for (final f in closed) {
+        for (final b in f) {
+          w.putIfAbsent(b.channel, _Welford.new).add(EegIndices.bandValue(b, band));
+        }
+      }
+      if (w.isNotEmpty) closedMean[band] = {for (final e in w.entries) e.key: e.value.mean};
+    }
+
+    if (_raw.isNotEmpty) {
+      linMean[EegCalibration.rawKey] = {for (final e in _raw.entries) e.key: e.value.mean};
+      linSd[EegCalibration.rawKey] = {for (final e in _raw.entries) e.key: e.value.sd};
+    }
 
     // Noise floor: the raw signal's spread around its DC level, averaged
-    // over channels. An excursion of four floors is an artifact (blink,
-    // jaw clench, cable tug) for the processor's purposes.
+    // over channels. Four floors is an artifact for the processor.
     final sds = _raw.values.map((w) => w.sd).where((v) => v.isFinite).toList();
     final noiseFloor = sds.isEmpty ? 0.0 : sds.reduce((a, b) => a + b) / sds.length;
 
@@ -125,17 +208,21 @@ class EegCalibrationBuilder {
       subjectId: subjectId,
       deviceType: deviceType,
       channels: channels,
-      baselines: baselines,
-      deviations: deviations,
-      eyesClosed: eyesClosed,
-      indexMeans: {for (final e in _indices.entries) e.key: e.value.mean},
-      indexDeviations: {for (final e in _indices.entries) e.key: e.value.sd},
+      baselines: linMean,
+      deviations: linSd,
+      eyesClosed: closedMean,
+      logMeans: logMean,
+      logDeviations: logSd,
+      headDeviations: headSd,
+      indexMeans: {for (final e in indices.entries) e.key: e.value.mean},
+      indexDeviations: {for (final e in indices.entries) e.key: e.value.sd},
       noiseFloor: noiseFloor,
       artifactThreshold: noiseFloor * 4,
       calibratedAt: now,
       eyesOpenSeconds: eyesOpenSeconds,
       eyesClosedSeconds: eyesClosedSeconds,
-      frames: _openFrames + _closedFrames,
+      frames: open.length + closed.length,
+      rejectedFrames: (_open.length - open.length) + (_closed.length - closed.length),
     );
   }
 
@@ -143,10 +230,14 @@ class EegCalibrationBuilder {
     _open.clear();
     _closed.clear();
     _raw.clear();
-    _indices.clear();
-    _openFrames = 0;
-    _closedFrames = 0;
     _rawSamples = 0;
+  }
+
+  static double _median(List<double> v) {
+    if (v.isEmpty) return 0;
+    final s = List.of(v)..sort();
+    final mid = s.length ~/ 2;
+    return s.length.isOdd ? s[mid] : (s[mid - 1] + s[mid]) / 2;
   }
 }
 

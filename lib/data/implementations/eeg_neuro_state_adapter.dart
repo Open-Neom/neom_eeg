@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:neom_core/domain/model/neom/neom_neuro_state.dart';
 import 'package:neom_core/domain/use_cases/neuro_state_service.dart';
@@ -8,6 +7,8 @@ import '../../domain/enums/eeg_connection_state.dart';
 import '../../domain/models/eeg_band_power.dart';
 import '../../domain/models/eeg_channel_catalog.dart';
 import '../../domain/use_cases/eeg_device_service.dart';
+import '../hub/eeg_hub.dart';
+import 'eeg_indices.dart';
 
 /// Exposes a connected EEG headset as a [NeuroStateService].
 ///
@@ -28,11 +29,18 @@ import '../../domain/use_cases/eeg_device_service.dart';
 /// | beta          | focus       |
 /// | gamma         | integration |
 ///
-/// [NeuroStateSnapshot.coherence] is hemispheric: `1 − |asymmetry|` of the
-/// dominant band over the best left/right pair the headset offers
-/// ([EegChannelCatalog.bestPair] — T7/T8 on Insight/EPOC, TP9/TP10 on Muse,
-/// AF7/AF8 on MN8…). Devices without a homologous pair fall back to the
-/// agreement between whatever channels they have.
+/// [NeuroStateSnapshot.coherence] is hemispheric, on alpha
+/// ([EegIndices.hemisphericBand]) and the best left/right pair the headset
+/// offers ([EegChannelCatalog.bestPair] — T7/T8 on Insight/EPOC/MN8,
+/// TP9/TP10 on Muse):
+///
+/// * spectral coherence (MSC) from the hub's raw-signal tracker when the
+///   device service is an [EegHub] with a fresh reading for that pair —
+///   [coherenceKind] `spectral`;
+/// * otherwise `1 − |asymmetry|` of alpha power — [coherenceKind]
+///   `symmetry`. The core field cannot be null, so this is the one place
+///   the two are carried by the same number; [coherenceKind] says which.
+/// * 0 when the headset has no pair — [coherenceKind] `none`.
 class EegNeuroStateAdapter implements NeuroStateService {
 
   EegNeuroStateAdapter({required this.deviceService});
@@ -59,6 +67,7 @@ class EegNeuroStateAdapter implements NeuroStateService {
 
   final _stateController = StreamController<NeuroStateSnapshot>.broadcast();
   StreamSubscription<List<EegBandPower>>? _bandPowerSub;
+  StreamSubscription<EegConnectionState>? _connectionSub;
 
   NeuroStateSnapshot _latest = NeuroStateSnapshot.neutral();
   NeomNeuroState? _target;
@@ -95,6 +104,10 @@ class EegNeuroStateAdapter implements NeuroStateService {
   EegHemisphericPair? get hemisphericPair => _pair;
   EegHemisphericPair? _pair;
 
+  /// What the last snapshot's `coherence` is.
+  EegCoherenceKind get coherenceKind => _kind;
+  EegCoherenceKind _kind = EegCoherenceKind.none;
+
   /// How close the reading is to [targetState], or null when none is set.
   /// 1.0 means the target is being held.
   double? get targetProximity {
@@ -110,12 +123,26 @@ class EegNeuroStateAdapter implements NeuroStateService {
     if (_isActive) return;
     _isActive = true;
     _bandPowerSub = deviceService.bandPowerStream.listen(_onBandPower);
+    final device = deviceService;
+    if (device is EegHub) {
+      // Frames simply stop when the headset goes away; say so, so listeners
+      // do not keep showing the last reading.
+      _connectionSub = device.connectionStateStream.listen((state) {
+        if (state == EegConnectionState.disconnected || state == EegConnectionState.error) {
+          _latest = NeuroStateSnapshot.neutral();
+          _kind = EegCoherenceKind.none;
+          if (!_stateController.isClosed) _stateController.add(_latest);
+        }
+      });
+    }
   }
 
   Future<void> stop() async {
     _isActive = false;
     await _bandPowerSub?.cancel();
     _bandPowerSub = null;
+    await _connectionSub?.cancel();
+    _connectionSub = null;
   }
 
   Future<void> dispose() async {
@@ -157,8 +184,7 @@ class EegNeuroStateAdapter implements NeuroStateService {
       amplitude: dominantShare.clamp(0.0, 1.0),
       frequency: _bandCenterHz[dominant]!,
       neuro: _bandState[dominant]!.normalizedValue,
-      coherence: _hemisphericCoherence(readings, dominant) ??
-          _coherenceAcross(readings, dominant),
+      coherence: _hemisphericCoherence(readings),
       // breath, beat and phase belong to the audio generator; a headset has
       // no source for them, so they stay at zero rather than being invented.
       timestamp: DateTime.now(),
@@ -168,49 +194,41 @@ class EegNeuroStateAdapter implements NeuroStateService {
     if (!_stateController.isClosed) _stateController.add(snapshot);
   }
 
-  /// `1 − |asymmetry index|` of [dominant] between the best homologous pair
-  /// present in [readings]; null when the device has no such pair.
-  double? _hemisphericCoherence(List<EegBandPower> readings, _Band dominant) {
-    final byChannel = {for (final r in readings) r.channel: r};
-    final pair = EegChannelCatalog.bestPair(byChannel.keys);
-    _pair = pair;
-    if (pair == null) return null;
-    final left = _bandValue(byChannel[pair.left]!, dominant);
-    final right = _bandValue(byChannel[pair.right]!, dominant);
-    final sum = left + right;
-    if (sum <= 0) return 0.0;
-    return (1.0 - ((left - right) / sum).abs()).clamp(0.0, 1.0);
-  }
-
-  /// Agreement between channels on the dominant band: 1.0 when every electrode
-  /// reports the same share, falling as they diverge. Fallback for layouts
-  /// without a left/right pair.
-  double _coherenceAcross(List<EegBandPower> readings, _Band dominant) {
-    if (readings.length < 2) return 0.0;
-
-    final shares = <double>[];
-    for (final r in readings) {
-      final total = r.delta + r.theta + r.alpha + r.betaLow + r.betaHigh + r.gamma;
-      if (total <= 0) continue;
-      shares.add(_bandValue(r, dominant) / total);
+  /// Spectral coherence when the hub has it for this pair, otherwise alpha
+  /// power symmetry; 0 without a pair. Sets [coherenceKind].
+  double _hemisphericCoherence(List<EegBandPower> readings) {
+    final asym = EegIndices.asymmetry(readings);
+    _pair = asym?.pair;
+    if (asym == null) {
+      _kind = EegCoherenceKind.none;
+      return 0.0;
     }
-    if (shares.length < 2) return 0.0;
-
-    final mean = shares.reduce((a, b) => a + b) / shares.length;
-    final variance = shares
-            .map((s) => (s - mean) * (s - mean))
-            .reduce((a, b) => a + b) /
-        shares.length;
-    return (1.0 - math.sqrt(variance) * 2).clamp(0.0, 1.0);
+    final device = deviceService;
+    if (device is EegHub) {
+      final c = device.lastCoherence;
+      final msc = c != null && c.pair == asym.pair && c.isFresh()
+          ? c.of(EegIndices.hemisphericBand)
+          : null;
+      if (msc != null) {
+        _kind = EegCoherenceKind.spectral;
+        return msc.clamp(0.0, 1.0);
+      }
+    }
+    _kind = EegCoherenceKind.symmetry;
+    return (1.0 - asym.index.abs()).clamp(0.0, 1.0);
   }
-
-  double _bandValue(EegBandPower r, _Band band) => switch (band) {
-        _Band.delta => r.delta,
-        _Band.theta => r.theta,
-        _Band.alpha => r.alpha,
-        _Band.beta => r.betaLow + r.betaHigh,
-        _Band.gamma => r.gamma,
-      };
 }
 
 enum _Band { delta, theta, alpha, beta, gamma }
+
+/// Which measure [EegNeuroStateAdapter] put in `NeuroStateSnapshot.coherence`.
+enum EegCoherenceKind {
+  /// Spectral coherence (MSC) of the raw signals.
+  spectral,
+
+  /// `1 − |asymmetry|` of band power (no raw EEG available).
+  symmetry,
+
+  /// No left/right pair; the value is 0.
+  none,
+}

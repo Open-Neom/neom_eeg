@@ -52,7 +52,11 @@ class EegBandPowerDeriver {
     }
     _sinceLastEmit = 0;
 
-    final frame = processor.extractBandPower(_buffer.toList(), channels);
+    final frame = processor.extractBandPower(
+      _buffer.toList(),
+      channels,
+      sampleRate: sampleRate.toDouble(),
+    );
     return frame.isEmpty ? null : frame;
   }
 

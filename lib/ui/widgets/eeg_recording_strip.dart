@@ -24,6 +24,9 @@ class EegRecordingStrip extends StatefulWidget {
     ('Síntoma', Icons.report_gmailerrorred, 2),
     ('Respiración', Icons.air, 3),
     ('Estímulo', Icons.graphic_eq, 4),
+    // Closing the eyes raises alpha by itself; marking it keeps an alpha
+    // rise from being read as an effect of the audio.
+    ('Ojos cerrados', Icons.visibility_off, 5),
   ];
 
   const EegRecordingStrip({

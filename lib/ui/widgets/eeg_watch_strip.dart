@@ -5,8 +5,8 @@ import '../../data/implementations/eeg_indices.dart';
 import '../../data/implementations/eeg_watch_controller.dart';
 import '../../domain/models/eeg_watch_rule.dart';
 
-/// Live indices the watcher evaluates (asymmetry, coherence, band
-/// z-scores, frontal activation) and the alerts it has raised, with a
+/// Live indices the watcher evaluates (asymmetry, power symmetry, spectral
+/// coherence, band z-scores, frontal activation) and the alerts it has raised, with a
 /// switch for automatic markers. Renders nothing when no
 /// [EegWatchController] is registered.
 class EegWatchStrip extends StatelessWidget {
@@ -115,7 +115,7 @@ class EegWatchStrip extends StatelessWidget {
               const Padding(
                 padding: EdgeInsets.only(top: 6),
                 child: Text(
-                  'Sin línea base personal: las reglas por desviación (beta, alfa, '
+                  'Sin línea base personal vigente: las reglas por desviación (beta, alfa, '
                   'hipofrontalidad) están dormidas; asimetría y contacto siguen activas.',
                   style: TextStyle(color: Colors.white38, fontSize: 10),
                 ),
@@ -146,10 +146,18 @@ class EegWatchStrip extends StatelessWidget {
         color: idx.asymmetry!.abs() > 0.2 ? Colors.amber : Colors.white70,
       ));
       chips.add(_Chip(
-        label: 'COHERENCIA',
-        value: idx.coherence!.toStringAsFixed(2),
-        color: idx.coherence! >= 0.8 ? Colors.greenAccent : Colors.white70,
+        label: 'SIMETRÍA α',
+        value: '${(idx.symmetry! * 100).round()}%',
+        color: idx.symmetry! >= 0.8 ? Colors.greenAccent : Colors.white70,
       ));
+      final coh = idx.coherence;
+      if (coh != null) {
+        chips.add(_Chip(
+          label: 'COHERENCIA α',
+          value: idx.coherenceSignificant ? coh.toStringAsFixed(2) : '${coh.toStringAsFixed(2)} (azar)',
+          color: idx.coherenceSignificant ? const Color(0xFF4DB6AC) : Colors.white54,
+        ));
+      }
     }
     for (final band in const ['alpha', 'theta', 'beta']) {
       final z = idx.z[band];
@@ -286,7 +294,7 @@ class _AlertRow extends StatelessWidget {
           const SizedBox(width: 8),
           Expanded(
             child: Text(
-              '${alert.label} · ${alert.value.toStringAsFixed(2)} ${alert.rule.above ? '>' : '<'} ${alert.threshold.toStringAsFixed(2)} · ${alert.sustained.inSeconds} s',
+              '${alert.label}${alert.pair != null ? ' ${alert.pair!.split(' ').first}' : ''} · ${alert.value.toStringAsFixed(2)} ${alert.rule.above ? '>' : '<'} ${alert.threshold.toStringAsFixed(2)} · ${alert.sustained.inSeconds} s',
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(color: active ? Colors.white : Colors.white70, fontSize: 11),

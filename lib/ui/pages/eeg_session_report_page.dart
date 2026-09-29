@@ -53,9 +53,9 @@ class EegSessionReportPage extends StatelessWidget {
                 ),
                 const SizedBox(height: 12),
                 _Section(
-                  title: 'COHERENCIA HEMISFÉRICA',
+                  title: 'HEMISFERIOS · COHERENCIA Y SIMETRÍA (α)',
                   icon: Icons.balance,
-                  child: SizedBox(height: 150, child: _CoherenceChart(capture: c)),
+                  child: _CoherenceChart(capture: c),
                 ),
                 const SizedBox(height: 12),
                 _Section(
@@ -137,24 +137,29 @@ class _SummaryTiles extends StatelessWidget {
       ('Segundos con señal', '${c.secondsWithSignal} / ${c.rows.length}', Colors.white),
       ('Banda dominante', c.dominantBand ?? '—', const Color(0xFF4DB6AC)),
       (
-        'Coherencia media',
-        c.avgCoherence == null ? '—' : '${(c.avgCoherence! * 100).round()}%',
+        'Coherencia α media',
+        c.avgCoherence == null ? '—' : c.avgCoherence!.toStringAsFixed(2),
+        Colors.white,
+      ),
+      (
+        'Simetría α media',
+        c.avgSymmetry == null ? '—' : '${(c.avgSymmetry! * 100).round()}%',
         Colors.white,
       ),
       ('Marcadores', '${c.markers.length}', Colors.white),
       if (c.alerts.isNotEmpty) ('Avisos', '${c.alerts.length}', Colors.amber),
-      if (c.entrainmentIndex('alpha') != null)
+      if (c.frequencyFollowing != null)
         (
-          'Entrainment alfa',
-          _ratio(c.entrainmentIndex('alpha')!),
-          c.entrainmentIndex('alpha')! >= 1.1
+          'Respuesta a ${_hz(c.frequencyFollowing!.hz)}',
+          'SNR ${c.frequencyFollowing!.meanSnr.toStringAsFixed(1)}×',
+          c.frequencyFollowing!.meanSnr >= 2
               ? Colors.greenAccent
-              : c.entrainmentIndex('alpha')! <= 0.9
+              : c.frequencyFollowing!.meanSnr >= 1.3
                   ? Colors.amber
                   : Colors.white,
         ),
-      if (c.entrainmentIndex('theta') != null)
-        ('Entrainment theta', _ratio(c.entrainmentIndex('theta')!), Colors.white),
+      if (c.bandShift('alpha') != null)
+        ('Cambio alfa fin/inicio', _ratio(c.bandShift('alpha')!), Colors.white),
     ];
     return Wrap(
       spacing: 8,
@@ -358,44 +363,82 @@ class _BandsChart extends StatelessWidget {
   }
 }
 
+/// Spectral coherence (does each side oscillate with the other?) and power
+/// symmetry (does each side carry the same amount of alpha?) per second.
 class _CoherenceChart extends StatelessWidget {
   final EegSessionCapture capture;
   const _CoherenceChart({required this.capture});
 
+  static const _coherenceColor = Color(0xFF4DB6AC);
+  static const _symmetryColor = Color(0xFF9FA8DA);
+
   @override
   Widget build(BuildContext context) {
-    final rows = capture.rows.where((r) => r.coherence != null).toList();
-    if (rows.isEmpty) {
-      return const Center(
-        child: Text('El headset no tiene par izquierdo/derecho utilizable',
-            style: TextStyle(color: Colors.white38, fontSize: 12)),
-      );
+    final coh = capture.rows.where((r) => r.coherence != null).toList();
+    final sym = capture.rows.where((r) => r.symmetry != null).toList();
+    if (coh.isEmpty && sym.isEmpty) {
+      return const Text('El headset no tiene par izquierdo/derecho utilizable',
+          style: TextStyle(color: Colors.white38, fontSize: 12));
     }
-    return LineChart(
-      LineChartData(
-        minX: 0,
-        maxX: capture.duration.inSeconds.toDouble().clamp(1, double.infinity),
-        minY: 0,
-        maxY: 1,
-        lineBarsData: [
-          LineChartBarData(
-            spots: [for (final r in rows) FlSpot(r.t, r.coherence!)],
-            color: const Color(0xFF4DB6AC),
-            barWidth: 1.8,
-            dotData: const FlDotData(show: false),
-            belowBarData: BarAreaData(show: true, color: const Color(0xFF4DB6AC).withValues(alpha: 0.12)),
-          ),
-        ],
-        gridData: FlGridData(
-          show: true,
-          drawVerticalLine: false,
-          horizontalInterval: 0.25,
-          getDrawingHorizontalLine: (_) => FlLine(color: Colors.white10, strokeWidth: 1),
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 14,
+          children: [
+            if (coh.isNotEmpty) const _Legend('Coherencia espectral (MSC)', _coherenceColor),
+            if (sym.isNotEmpty) const _Legend('Simetría de potencia', _symmetryColor),
+          ],
         ),
-        borderData: FlBorderData(show: false),
-        titlesData: _axes(capture, leftFormatter: (v) => '${(v * 100).round()}%'),
-        lineTouchData: const LineTouchData(enabled: false),
-      ),
+        if (coh.isEmpty)
+          const Padding(
+            padding: EdgeInsets.only(top: 4),
+            child: Text(
+              'Sin coherencia espectral: el headset no entregó EEG crudo en esta sesión '
+              '(en Emotiv requiere licencia de datos crudos).',
+              style: TextStyle(color: Colors.white38, fontSize: 11),
+            ),
+          ),
+        const SizedBox(height: 8),
+        SizedBox(
+          height: 150,
+          child: LineChart(
+            LineChartData(
+              minX: 0,
+              maxX: capture.duration.inSeconds.toDouble().clamp(1, double.infinity),
+              minY: 0,
+              maxY: 1,
+              lineBarsData: [
+                if (sym.isNotEmpty)
+                  LineChartBarData(
+                    spots: [for (final r in sym) FlSpot(r.t, r.symmetry!)],
+                    color: _symmetryColor,
+                    barWidth: 1.2,
+                    dashArray: const [4, 3],
+                    dotData: const FlDotData(show: false),
+                  ),
+                if (coh.isNotEmpty)
+                  LineChartBarData(
+                    spots: [for (final r in coh) FlSpot(r.t, r.coherence!)],
+                    color: _coherenceColor,
+                    barWidth: 1.8,
+                    dotData: const FlDotData(show: false),
+                    belowBarData: BarAreaData(show: true, color: _coherenceColor.withValues(alpha: 0.12)),
+                  ),
+              ],
+              gridData: FlGridData(
+                show: true,
+                drawVerticalLine: false,
+                horizontalInterval: 0.25,
+                getDrawingHorizontalLine: (_) => FlLine(color: Colors.white10, strokeWidth: 1),
+              ),
+              borderData: FlBorderData(show: false),
+              titlesData: _axes(capture, leftFormatter: (v) => v.toStringAsFixed(2)),
+              lineTouchData: const LineTouchData(enabled: false),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -482,7 +525,8 @@ class _Events extends StatelessWidget {
                     ? Colors.amber
                     : Colors.lightBlueAccent,
             time: _mmss(a.t.round()),
-            text: '${a.label} · ${a.value.toStringAsFixed(2)} vs ${a.threshold.toStringAsFixed(2)} · '
+            text: '${a.label}${a.pair != null ? ' (${a.pair})' : ''} · '
+                '${a.value.toStringAsFixed(2)} vs ${a.threshold.toStringAsFixed(2)} · '
                 'sostenido ${a.sustainedSeconds.round()} s'
                 '${a.markerAdded ? ' · marcado' : ''}',
           ),
@@ -613,6 +657,8 @@ class _Tag extends StatelessWidget {
 String _two(int v) => v.toString().padLeft(2, '0');
 
 String _mmss(int seconds) => '${_two(seconds ~/ 60)}:${_two(seconds % 60)}';
+
+String _hz(double hz) => '${hz.toStringAsFixed(hz % 1 == 0 ? 0 : 1)} Hz';
 
 /// Share at the end ÷ share at the start, shown as a change: ×1.30 = +30 %.
 String _ratio(double r) => '${r >= 1 ? '+' : '−'}${((r - 1).abs() * 100).round()}%';

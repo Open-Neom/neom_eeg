@@ -1,17 +1,19 @@
 import 'package:flutter/material.dart';
 
+import '../../data/implementations/eeg_coherence_tracker.dart';
 import '../../data/implementations/eeg_signal_processor.dart';
 import '../../domain/models/eeg_band_power.dart';
 import '../../domain/models/eeg_channel_catalog.dart';
 import 'eeg_asymmetry_indicator.dart';
 
 /// Left/right balance for whatever homologous pair the connected headset
-/// offers — T7/T8 on an Insight, TP9/TP10 on a Muse, AF7/AF8 on an MN8 —
-/// so the same panel reads correctly on every model.
+/// offers — T7/T8 on an Insight or MN8, TP9/TP10 on a Muse — so the same
+/// panel reads correctly on every model.
 ///
-/// Wraps [EegAsymmetryIndicator] with the region the pair covers and the
-/// derived coherence (`1 − |asymmetry|`), which is the value the
-/// NeuroStateService snapshot carries into the Cámara Neom.
+/// Wraps [EegAsymmetryIndicator] with the region the pair covers, the power
+/// **symmetry** (`1 − |asymmetry|`: same amount of the rhythm on both
+/// sides) and, when the hub has raw EEG, the spectral **coherence** of the
+/// pair (both sides oscillating together) with its chance threshold.
 class EegHemisphericBalance extends StatelessWidget {
   final List<EegBandPower> frame;
   final String band;
@@ -20,11 +22,16 @@ class EegHemisphericBalance extends StatelessWidget {
   /// asymmetry — the next pair down the catalog is used instead.
   final Set<String> excluded;
 
+  /// Latest coherence reading of the hub; shown only when it belongs to the
+  /// pair this panel is displaying.
+  final EegPairCoherence? coherence;
+
   const EegHemisphericBalance({
     super.key,
     required this.frame,
     this.band = 'alpha',
     this.excluded = const {},
+    this.coherence,
   });
 
   @override
@@ -77,7 +84,9 @@ class EegHemisphericBalance extends StatelessWidget {
       byChannel[pair.right]!,
       band,
     );
-    final coherence = (1.0 - asymmetry.asymmetryIndex.abs()).clamp(0.0, 1.0);
+    final symmetry = (1.0 - asymmetry.asymmetryIndex.abs()).clamp(0.0, 1.0);
+    final c = coherence;
+    final msc = c != null && c.pair == pair && c.isFresh() ? c.of(band) : null;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -103,11 +112,11 @@ class EegHemisphericBalance extends StatelessWidget {
                 ),
               ),
               Text(
-                'coherencia ${(coherence * 100).round()}%',
+                'simetría ${(symmetry * 100).round()}%',
                 style: TextStyle(
-                  color: coherence > 0.8
+                  color: symmetry > 0.8
                       ? Colors.greenAccent
-                      : coherence > 0.6
+                      : symmetry > 0.6
                           ? Colors.amber
                           : Colors.redAccent,
                   fontSize: 11,
@@ -118,6 +127,35 @@ class EegHemisphericBalance extends StatelessWidget {
           ),
         ),
         EegAsymmetryIndicator(asymmetry: asymmetry),
+        if (msc != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 6, left: 2),
+            child: Tooltip(
+              message: 'Coherencia espectral (MSC, ventana de ${c!.window.inSeconds} s): '
+                  '¿oscilan ambos lados juntos? Bajo ${(c.threshold(band) ?? 1).toStringAsFixed(2)} '
+                  'no se distingue del azar. La imaginaria (${(c.imaginary[band] ?? 0).toStringAsFixed(2)}) '
+                  'descarta el acoplamiento por la referencia común.',
+              child: Row(
+                children: [
+                  const Icon(Icons.waves, size: 13, color: Colors.white38),
+                  const SizedBox(width: 6),
+                  Text(
+                    'coherencia ${msc.toStringAsFixed(2)}',
+                    style: TextStyle(
+                      color: c.isSignificant(band) ? const Color(0xFF4DB6AC) : Colors.white54,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    c.isSignificant(band) ? 'sobre el azar' : 'no distinguible del azar',
+                    style: const TextStyle(color: Colors.white38, fontSize: 10),
+                  ),
+                ],
+              ),
+            ),
+          ),
         if (!pair.isTemporal)
           const Padding(
             padding: EdgeInsets.only(top: 4, left: 2),

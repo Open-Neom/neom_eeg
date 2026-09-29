@@ -50,8 +50,11 @@ void main() {
       expect(caps.nativeMentalMetrics, isTrue);
       expect(caps.contactQuality, isTrue);
       expect(caps.temporalCoverage, isTrue, reason: 'Insight has T7/T8');
+      // MN8/MW20 electrodes sit in the ear canal: Cortex reports T7/T8.
       expect(provider.capabilitiesFor(EegDeviceType.emotivMn8).temporalCoverage,
-          isFalse);
+          isTrue);
+      expect(provider.capabilitiesFor(EegDeviceType.emotivMw20).temporalCoverage,
+          isTrue);
       expect(caps.transports,
           {EegTransport.cortexService, EegTransport.cortexLibrary});
     });

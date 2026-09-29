@@ -98,7 +98,11 @@ void main() {
     await tester.pump();
     expect(find.textContaining('ASIM T7/T8'), findsOneWidget);
     expect(find.text('+0.33'), findsOneWidget);
-    expect(find.textContaining('COHERENCIA'), findsOneWidget);
+    // Power symmetry is shown as such; spectral coherence only appears
+    // with raw EEG, which this test does not send.
+    expect(find.text('SIMETRÍA α'), findsOneWidget);
+    expect(find.text('COHERENCIA α'), findsNothing);
+    expect(find.textContaining('simetría 67%'), findsOneWidget);
     expect(watch.indices.value.isCalibrated, isFalse);
 
     // Auto-marker switch is wired to the controller.

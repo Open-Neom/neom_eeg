@@ -16,6 +16,8 @@ import '../../domain/models/eeg_session_capture.dart';
 import '../../domain/models/eeg_watch_rule.dart';
 import '../../domain/use_cases/eeg_recording_service.dart';
 import '../hub/eeg_hub.dart';
+import 'eeg_indices.dart';
+import 'eeg_spectral.dart';
 
 /// Real-time health of the EEG link, refreshed every second.
 class EegLiveStats {
@@ -76,10 +78,20 @@ class EegSessionCaptureController extends SintController {
   final int bufferSeconds;
   final Duration contextInterval;
 
+  /// Raw window the stimulus-following SNR is computed over (≥ 4 s for the
+  /// 0.25 Hz resolution it needs).
+  final Duration ffrWindow;
+
+  /// At most this many electrodes are used for the SNR (temporal and
+  /// posterior first), to bound the cost on 32-channel caps.
+  final int ffrMaxChannels;
+
   EegSessionCaptureController({
     required this.hub,
     this.bufferSeconds = 2 * 3600,
     this.contextInterval = const Duration(seconds: 5),
+    this.ffrWindow = const Duration(seconds: 8),
+    this.ffrMaxChannels = 6,
     Duration tick = const Duration(seconds: 1),
   }) : _tick = tick;
 
@@ -98,7 +110,7 @@ class EegSessionCaptureController extends SintController {
   DateTime? _lastSampleAt;
   int _totalSamples = 0;
   EegMentalState? _lastMetrics;
-  double? _lastCoherence;
+  final _rawWindow = <String, ListQueue<double>>{};
   Timer? _ticker;
   final _subs = <StreamSubscription<dynamic>>[];
   StreamSubscription<EegRecording?>? _recordingSub;
@@ -228,6 +240,7 @@ class EegSessionCaptureController extends SintController {
       threshold: alert.threshold,
       sustainedSeconds: alert.sustained.inMilliseconds / 1000.0,
       markerAdded: alert.markerAdded,
+      pair: alert.pair,
     ));
   }
 
@@ -315,6 +328,17 @@ class EegSessionCaptureController extends SintController {
     _lastSampleAt = DateTime.now();
     _totalSamples++;
     _acc.samples++;
+
+    final rate = hub.connectedDevice?.sampleRate ?? 0;
+    if (rate <= 0) return;
+    final cap = (ffrWindow.inMicroseconds * rate / 1000000).round();
+    for (final e in s.channels.entries) {
+      final q = _rawWindow.putIfAbsent(e.key, ListQueue<double>.new);
+      q.addLast(e.value.isFinite ? e.value : 0.0);
+      while (q.length > cap) {
+        q.removeFirst();
+      }
+    }
   }
 
   void _onBands(List<EegBandPower> frame) {
@@ -330,16 +354,12 @@ class EegSessionCaptureController extends SintController {
     }
     _acc.channelReadings += frame.length;
 
-    final byChannel = {for (final b in frame) b.channel: b};
-    final pair = EegChannelCatalog.bestPair(byChannel.keys);
-    if (pair != null) {
-      final l = byChannel[pair.left]!.alpha;
-      final r = byChannel[pair.right]!.alpha;
-      final sum = l + r;
-      final c = sum <= 0 ? 0.0 : (1.0 - ((l - r) / sum).abs()).clamp(0.0, 1.0);
-      _lastCoherence = c;
-      _acc.coherenceSum += c;
-      _acc.coherenceCount++;
+    // Power symmetry of alpha on the frame's pair (the hub already dropped
+    // electrodes without contact, so this is the hub's analysis pair).
+    final sym = EegIndices.symmetry(frame);
+    if (sym != null) {
+      _acc.symmetrySum += sym;
+      _acc.symmetryCount++;
     }
   }
 
@@ -348,6 +368,7 @@ class EegSessionCaptureController extends SintController {
       _totalSamples = 0;
       _lastSampleAt = null;
       _acc = _Accumulator();
+      _rawWindow.clear();
       _followRecording();
     } else if (state == EegConnectionState.disconnected ||
         state == EegConnectionState.error) {
@@ -417,6 +438,8 @@ class EegSessionCaptureController extends SintController {
 
     final n = acc.channelReadings == 0 ? 1 : acc.channelReadings;
     final m = _lastMetrics;
+    final coherence = hub.lastCoherence;
+    final ffr = _frequencyFollowing();
     _rows.addLast(_TimedRow(
       at: now,
       row: EegCaptureRow(
@@ -427,9 +450,12 @@ class EegSessionCaptureController extends SintController {
         betaLow: acc.betaLow / n,
         betaHigh: acc.betaHigh / n,
         gamma: acc.gamma / n,
-        coherence: acc.coherenceCount > 0
-            ? acc.coherenceSum / acc.coherenceCount
-            : _lastCoherence,
+        coherence: connected && coherence != null && coherence.isFresh(now: now)
+            ? coherence.of(EegIndices.hemisphericBand)
+            : null,
+        symmetry: acc.symmetryCount > 0 ? acc.symmetrySum / acc.symmetryCount : null,
+        ffrSnr: ffr?.snr,
+        ffrHz: ffr?.hz,
         focus: m?.focus,
         relaxation: m?.relaxation,
         engagement: m?.engagement,
@@ -442,6 +468,48 @@ class EegSessionCaptureController extends SintController {
     while (_rows.length > bufferSeconds) {
       _rows.removeFirst();
     }
+  }
+
+  /// Stimulus the host is playing, from the latest context sample of the
+  /// open segment: the isochronic pulse when on, otherwise the binaural
+  /// beat. Null when neither is set.
+  double? _stimulusHz() {
+    final ctx = _segment?.context;
+    if (ctx == null || ctx.isEmpty) return null;
+    final last = ctx.last;
+    final iso = last.hz(EegContextKeys.isochronicHz);
+    if (iso != null && iso > 0) return iso;
+    final beat = last.hz(EegContextKeys.beatHz);
+    if (beat != null && beat > 0) return beat;
+    return null;
+  }
+
+  /// SNR at the stimulus frequency, averaged over up to [ffrMaxChannels]
+  /// electrodes in contact (temporal and posterior first: auditory and
+  /// resting-alpha cortex).
+  ({double snr, double hz})? _frequencyFollowing() {
+    final hz = _stimulusHz();
+    final rate = hub.connectedDevice?.sampleRate ?? 0;
+    if (hz == null || rate <= 0 || _segment == null) return null;
+    final excluded = hub.excludedChannels.toSet();
+    final full = (ffrWindow.inMicroseconds * rate / 1000000).round();
+    final channels = _rawWindow.keys
+        .where((c) => !excluded.contains(c) && _rawWindow[c]!.length >= full)
+        .toList()
+      ..sort((a, b) => _ffrPriority(a).compareTo(_ffrPriority(b)));
+    final snrs = <double>[];
+    for (final c in channels.take(ffrMaxChannels)) {
+      final v = EegSpectral.frequencyFollowingSnr(_rawWindow[c]!.toList(), rate.toDouble(), hz);
+      if (v != null) snrs.add(v);
+    }
+    if (snrs.isEmpty) return null;
+    return (snr: snrs.reduce((a, b) => a + b) / snrs.length, hz: hz);
+  }
+
+  static int _ffrPriority(String channel) {
+    if (EegChannelCatalog.isTemporal(channel)) return 0;
+    if (EegChannelCatalog.isPosterior(channel)) return 1;
+    return 2;
   }
 
   void _sampleContext() {
@@ -494,8 +562,8 @@ class _Accumulator {
   int frames = 0;
   int channelReadings = 0;
   double delta = 0, theta = 0, alpha = 0, betaLow = 0, betaHigh = 0, gamma = 0;
-  double coherenceSum = 0;
-  int coherenceCount = 0;
+  double symmetrySum = 0;
+  int symmetryCount = 0;
 }
 
 class _Segment {

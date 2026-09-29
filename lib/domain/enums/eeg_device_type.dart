@@ -13,6 +13,10 @@ enum EegDeviceType {
   emotivInsight(EegVendor.emotiv, 5, 128, 'Emotiv Insight'),
   emotivMn8(EegVendor.emotiv, 2, 128, 'Emotiv MN8'),
 
+  /// EEG earbuds, same two-channel T7/T8 family as the MN8 (Emotiv's own
+  /// Unity plugin groups them: `HeadsetFamily.MN8`).
+  emotivMw20(EegVendor.emotiv, 2, 128, 'Emotiv MW20'),
+
   // ── Interaxon ──────────────────────────────────────────────────────
   muse(EegVendor.interaxon, 4, 256, 'Muse 2/S'),
 
@@ -49,7 +53,8 @@ enum EegDeviceType {
       values.where((t) => t.vendor == vendor).toList();
 
   /// Resolve an Emotiv model from a Cortex headset id (`INSIGHT-A1B2C3D4`,
-  /// `EPOCX-…`, `EPOCPLUS-…`, `EPOCFLEX-…`, `MN8-…`) or from the
+  /// `INSIGHT2-…`, `EPOCX-…`, `EPOCPLUS-…`, `EPOCFLEX-…`, `MN8-…`, `MW20-…`)
+  /// or from the
   /// `settings.mode` field of a `queryHeadsets` result.
   ///
   /// Returns null when the string does not identify an Emotiv headset.
@@ -57,6 +62,7 @@ enum EegDeviceType {
     final upper = idOrMode.toUpperCase();
     if (upper.startsWith('INSIGHT')) return emotivInsight;
     if (upper.startsWith('MN8')) return emotivMn8;
+    if (upper.startsWith('MW20')) return emotivMw20;
     if (upper.startsWith('EPOCFLEX') || upper.startsWith('FLEX')) {
       return emotivEpocFlex;
     }

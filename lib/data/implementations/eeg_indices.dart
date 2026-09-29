@@ -1,44 +1,52 @@
 import '../../domain/models/eeg_band_power.dart';
 import '../../domain/models/eeg_calibration.dart';
 import '../../domain/models/eeg_channel_catalog.dart';
+import 'eeg_coherence_tracker.dart';
 
-/// Whole-head indices computed from one band-power frame, optionally
-/// z-scored against a personal [EegCalibration]. Immutable; produced by
-/// [EegIndices.compute] and consumed by the watcher, the dashboard and the
-/// session report.
+/// Whole-head indices of one band-power frame, optionally z-scored against
+/// a personal [EegCalibration]. Produced by [EegIndices.compute] and read by
+/// the watcher, the dashboard and the session capture.
+///
+/// Two different hemispheric numbers, never confused:
+/// * [symmetry] — `1 − |asymmetry|` of band **power**: do both sides carry
+///   the same amount of the rhythm?
+/// * [coherence] — spectral coherence (MSC) of the raw signals of the same
+///   pair: do both sides oscillate **together**? Comes from the hub's
+///   coherence tracker; null without raw EEG.
 class EegLiveIndices {
   final DateTime at;
 
-  /// Band the asymmetry and coherence were computed on.
+  /// Band the hemispheric numbers refer to ([EegIndices.hemisphericBand]).
   final String band;
 
   /// Left/right pair used, or null when the frame had none.
   final EegHemisphericPair? pair;
 
-  /// `(left − right) / (left + right)` of [band] on [pair]; `-1..1`.
+  /// `(left − right) / (left + right)` of [band] power on [pair]; `-1..1`.
   final double? asymmetry;
 
   /// `1 − |asymmetry|`; `0..1`.
-  final double? coherence;
+  final double? symmetry;
+
+  /// The hub's coherence reading for [pair], when it matches and is fresh.
+  final EegPairCoherence? pairCoherence;
 
   /// Share of each band in the whole-head total (`beta` is low + high).
   final Map<String, double> shares;
 
-  /// Whole-head z-score per band against the calibration; empty without one.
+  /// Whole-head z per band against the calibration, in σ of the whole-head
+  /// quantity ([EegCalibration.headZ]); empty without a usable baseline.
   final Map<String, double> z;
 
   /// Frontal β ÷ (α + θ) — the engagement index of Pope et al. (1995)
-  /// restricted to prefrontal/frontal electrodes. Higher = more analytic
-  /// activity. Null when the frame has no frontal channel.
+  /// restricted to prefrontal/frontal electrodes. Null without one.
   final double? frontalActivation;
 
-  /// [frontalActivation] z-scored against the resting value; null without
-  /// calibration.
+  /// [frontalActivation] z-scored against rest (log domain).
   final double? frontalActivationZ;
 
   /// How far frontal activation has dropped below the personal resting
-  /// level: `(baseline − current) / baseline`, clamped to `0..1`. 0 = at
-  /// baseline or above, 1 = frontal β gone. Null without calibration.
+  /// level: `1 − current / rest`, clamped to `0..1`.
   final double? hypofrontality;
 
   /// Share of alpha over posterior electrodes; null when there are none.
@@ -49,10 +57,11 @@ class EegLiveIndices {
 
   const EegLiveIndices({
     required this.at,
-    this.band = 'alpha',
+    this.band = EegIndices.hemisphericBand,
     this.pair,
     this.asymmetry,
-    this.coherence,
+    this.symmetry,
+    this.pairCoherence,
     this.shares = const {},
     this.z = const {},
     this.frontalActivation,
@@ -67,13 +76,25 @@ class EegLiveIndices {
   bool get isEmpty => shares.isEmpty;
 
   bool get isCalibrated => z.isNotEmpty;
+
+  /// Spectral coherence of [band] on [pair]; null without raw EEG.
+  double? get coherence => pairCoherence?.of(band);
+
+  /// Imaginary coherence of [band] (robust to the shared reference).
+  double? get imaginaryCoherence => pairCoherence?.imaginary[band];
+
+  bool get coherenceSignificant => pairCoherence?.isSignificant(band) ?? false;
 }
 
-/// Pure functions over band-power frames. Everything the watcher alerts
-/// on and the report scores is defined here, once, so a threshold means
-/// the same thing on an Insight, a Muse or the simulator.
+/// Pure functions over band-power frames. Every threshold the watcher
+/// applies and every number the report shows is defined here, once, so it
+/// means the same thing on an Insight, a Muse or the simulator.
 class EegIndices {
   EegIndices._();
+
+  /// The band hemispheric symmetry and coherence are reported on across
+  /// the module (dashboard, capture, neuro state, watcher defaults).
+  static const hemisphericBand = 'alpha';
 
   static const bands = ['delta', 'theta', 'alpha', 'beta', 'gamma'];
 
@@ -113,22 +134,37 @@ class EegIndices {
     return totals.map((b, v) => MapEntry(b, v / total));
   }
 
-  /// Asymmetry index of [band] on the best pair in [frame], with the pair.
+  /// Asymmetry index of [band] on [pair] (the best pair in [frame] when
+  /// omitted), with the pair used. Null when the pair is not in the frame.
   static ({EegHemisphericPair pair, double index})? asymmetry(
     Iterable<EegBandPower> frame, {
-    String band = 'alpha',
+    String band = hemisphericBand,
+    EegHemisphericPair? pair,
   }) {
     final byChannel = {for (final b in frame) b.channel: b};
-    final pair = EegChannelCatalog.bestPair(byChannel.keys);
-    if (pair == null) return null;
-    final l = bandValue(byChannel[pair.left]!, band);
-    final r = bandValue(byChannel[pair.right]!, band);
+    final p = pair ?? EegChannelCatalog.bestPair(byChannel.keys);
+    if (p == null) return null;
+    final left = byChannel[p.left];
+    final right = byChannel[p.right];
+    if (left == null || right == null) return null;
+    final l = bandValue(left, band);
+    final r = bandValue(right, band);
     final sum = l + r;
-    return (pair: pair, index: sum <= 0 ? 0.0 : (l - r) / sum);
+    return (pair: p, index: sum <= 0 ? 0.0 : (l - r) / sum);
   }
 
-  /// Frontal β ÷ (α + θ); null when [frame] has no frontal electrode or
-  /// the denominator is zero.
+  /// `1 − |asymmetry|` of [band]; same pair rules as [asymmetry].
+  static double? symmetry(
+    Iterable<EegBandPower> frame, {
+    String band = hemisphericBand,
+    EegHemisphericPair? pair,
+  }) {
+    final a = asymmetry(frame, band: band, pair: pair);
+    return a == null ? null : (1.0 - a.index.abs()).clamp(0.0, 1.0);
+  }
+
+  /// Frontal β ÷ (α + θ); null without a frontal electrode or when the
+  /// denominator is zero.
   static double? frontalActivation(Iterable<EegBandPower> frame) {
     var beta = 0.0, slow = 0.0;
     var any = false;
@@ -154,11 +190,13 @@ class EegIndices {
     return alpha / total;
   }
 
-  /// Everything at once, z-scored when [calibration] is given.
+  /// Everything at once. [coherence] is the hub's latest reading; it is
+  /// attached only when it belongs to the same pair as this frame.
   static EegLiveIndices compute(
     List<EegBandPower> frame, {
     EegCalibration? calibration,
-    String band = 'alpha',
+    EegPairCoherence? coherence,
+    String band = hemisphericBand,
     int excludedChannels = 0,
     DateTime? at,
   }) {
@@ -171,14 +209,14 @@ class EegIndices {
     double? hypo;
     if (calibration != null) {
       for (final b in bands) {
-        final v = calibration.zScore(b, mean(frame, b));
+        final v = calibration.headZ(b, frame);
         if (v != null) z[b] = v;
       }
       if (fa != null) {
-        faZ = calibration.indexZ(EegCalibration.frontalActivationIndex, fa);
-        final base = calibration.indexMeans[EegCalibration.frontalActivationIndex];
-        if (base != null && base > 0) {
-          hypo = ((base - fa) / base).clamp(0.0, 1.0);
+        faZ = calibration.frontalActivationZ(fa);
+        final rest = calibration.frontalActivationRest;
+        if (rest != null && rest > 0 && calibration.supportsZ) {
+          hypo = (1 - fa / rest).clamp(0.0, 1.0);
         }
       }
     }
@@ -188,7 +226,8 @@ class EegIndices {
       band: band,
       pair: asym?.pair,
       asymmetry: asym?.index,
-      coherence: asym == null ? null : (1.0 - asym.index.abs()).clamp(0.0, 1.0),
+      symmetry: asym == null ? null : (1.0 - asym.index.abs()).clamp(0.0, 1.0),
+      pairCoherence: coherence != null && coherence.pair == asym?.pair ? coherence : null,
       shares: shares(frame),
       z: z,
       frontalActivation: fa,

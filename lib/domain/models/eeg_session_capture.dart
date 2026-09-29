@@ -41,9 +41,23 @@ class EegCaptureRow {
   final double betaHigh;
   final double gamma;
 
-  /// Hemispheric coherence (`1 − |asymmetry|` of the dominant band on the
-  /// device's best left/right pair); null when the device has no pair.
+  /// Spectral coherence (MSC) of alpha between the two electrodes of the
+  /// hub's analysis pair; null without raw EEG or without a pair.
   final double? coherence;
+
+  /// `1 − |asymmetry|` of alpha power on the same pair, averaged over the
+  /// second; null without a pair.
+  final double? symmetry;
+
+  /// Steady-state response at the stimulus frequency the host was playing
+  /// ([ffrHz]): power there ÷ neighbouring frequencies, 8 s window. ≈1 =
+  /// nothing; ≥2 = the EEG follows the stimulus. Null when nothing with a
+  /// beat or pulse was playing.
+  final double? ffrSnr;
+
+  /// Stimulus frequency [ffrSnr] was measured at (isochronic pulse, else
+  /// binaural beat).
+  final double? ffrHz;
 
   /// Cognitive metrics as of this second (native or estimated); null until
   /// the first one arrives.
@@ -68,6 +82,9 @@ class EegCaptureRow {
     required this.betaHigh,
     required this.gamma,
     this.coherence,
+    this.symmetry,
+    this.ffrSnr,
+    this.ffrHz,
     this.focus,
     this.relaxation,
     this.engagement,
@@ -101,6 +118,9 @@ class EegCaptureRow {
         betaHigh: betaHigh,
         gamma: gamma,
         coherence: coherence,
+        symmetry: symmetry,
+        ffrSnr: ffrSnr,
+        ffrHz: ffrHz,
         focus: focus,
         relaxation: relaxation,
         engagement: engagement,
@@ -110,13 +130,18 @@ class EegCaptureRow {
         frames: frames,
       );
 
-  /// Compact list form for storage: fixed positions, nulls kept.
+  /// Compact list form for storage: fixed positions, nulls kept. Fields
+  /// added after the first schema are appended (15+).
   List<dynamic> toList() => [
         t, delta, theta, alpha, betaLow, betaHigh, gamma, coherence,
         focus, relaxation, engagement, excitement, stress, samples, frames,
+        symmetry, ffrSnr, ffrHz,
       ];
 
-  factory EegCaptureRow.fromList(List<dynamic> l) {
+  /// [legacy] rows (capture schema 1) stored `1 − |asymmetry|` at position
+  /// 7 under the name "coherence"; it is read back as [symmetry], and
+  /// [coherence] stays null because no spectral coherence was measured.
+  factory EegCaptureRow.fromList(List<dynamic> l, {bool legacy = false}) {
     double d(int i) => (l[i] as num).toDouble();
     double? n(int i) => l.length > i && l[i] != null ? (l[i] as num).toDouble() : null;
     return EegCaptureRow(
@@ -127,7 +152,10 @@ class EegCaptureRow {
       betaLow: d(4),
       betaHigh: d(5),
       gamma: d(6),
-      coherence: n(7),
+      coherence: legacy ? null : n(7),
+      symmetry: legacy ? n(7) : n(15),
+      ffrSnr: legacy ? null : n(16),
+      ffrHz: legacy ? null : n(17),
       focus: n(8),
       relaxation: n(9),
       engagement: n(10),
@@ -207,6 +235,9 @@ class EegAlertNote {
   final double sustainedSeconds;
   final bool markerAdded;
 
+  /// Left/right pair for hemispheric rules (`T7/T8 (temporal)`).
+  final String? pair;
+
   const EegAlertNote({
     required this.t,
     required this.ruleId,
@@ -216,6 +247,7 @@ class EegAlertNote {
     required this.threshold,
     required this.sustainedSeconds,
     this.markerAdded = false,
+    this.pair,
   });
 
   Map<String, dynamic> toJson() => {
@@ -227,6 +259,7 @@ class EegAlertNote {
         'threshold': threshold,
         'sustainedSeconds': sustainedSeconds,
         'markerAdded': markerAdded,
+        'pair': pair,
       };
 
   factory EegAlertNote.fromJson(Map<String, dynamic> j) => EegAlertNote(
@@ -238,6 +271,7 @@ class EegAlertNote {
         threshold: (j['threshold'] as num?)?.toDouble() ?? 0,
         sustainedSeconds: (j['sustainedSeconds'] as num?)?.toDouble() ?? 0,
         markerAdded: j['markerAdded'] as bool? ?? false,
+        pair: j['pair'] as String?,
       );
 }
 
@@ -254,10 +288,33 @@ class EegFrequencyUse {
   });
 }
 
+/// Stimulus-following response over a capture.
+class EegFrequencyFollowing {
+  /// Most-played stimulus frequency (Hz).
+  final double hz;
+
+  /// Mean SNR over the seconds it was measured.
+  final double meanSnr;
+
+  /// Share of those seconds with SNR ≥ 2.
+  final double followingShare;
+  final int seconds;
+
+  const EegFrequencyFollowing({
+    required this.hz,
+    required this.meanSnr,
+    required this.followingShare,
+    required this.seconds,
+  });
+}
+
 /// Everything captured around one session: the EEG the headset produced,
 /// what the host was playing, what the microphone heard and what the user
 /// marked. Persisted in Hive so a session can be understood afterwards.
 class EegSessionCapture {
+  /// 2: `coherence` is spectral and `symmetry`/`ffrSnr`/`ffrHz` exist.
+  static const currentSchema = 2;
+
   final String id;
 
   /// Id of the host session this capture belongs to (the Cámara Neom
@@ -365,6 +422,30 @@ class EegSessionCapture {
   double? get maxCoherence =>
       _coherences.isEmpty ? null : _coherences.reduce((a, b) => a > b ? a : b);
 
+  double? get avgSymmetry {
+    final v = [for (final r in rows) ?r.symmetry];
+    return v.isEmpty ? null : v.reduce((a, b) => a + b) / v.length;
+  }
+
+  /// How strongly the EEG followed the stimulus frequency; null when no
+  /// second measured it.
+  EegFrequencyFollowing? get frequencyFollowing {
+    final measured = [for (final r in rows) if (r.ffrSnr != null && r.ffrHz != null) r];
+    if (measured.isEmpty) return null;
+    final byHz = <double, int>{};
+    for (final r in measured) {
+      byHz.update(r.ffrHz!, (v) => v + 1, ifAbsent: () => 1);
+    }
+    final hz = byHz.entries.reduce((a, b) => a.value >= b.value ? a : b).key;
+    final snrs = [for (final r in measured) r.ffrSnr!];
+    return EegFrequencyFollowing(
+      hz: hz,
+      meanSnr: snrs.reduce((a, b) => a + b) / snrs.length,
+      followingShare: snrs.where((v) => v >= 2).length / snrs.length,
+      seconds: measured.length,
+    );
+  }
+
   Map<String, double?> get avgMetrics {
     double? avg(double? Function(EegCaptureRow) f) {
       final v = [for (final r in rows) if (f(r) != null) f(r)!];
@@ -433,11 +514,12 @@ class EegSessionCapture {
     return v / r.total;
   }
 
-  /// Did the session move the spectrum towards [band]? Mean share of the
-  /// band over the last third of the session ÷ over the first third. 1.0 =
-  /// unchanged; 1.3 = 30 % more of the spectrum in the target band at the
-  /// end than at the start. Null when either third has no frames.
-  double? entrainmentIndex(String band) {
+  /// Share of [band] over the last third of the session ÷ over the first
+  /// third. 1.0 = unchanged; 1.3 = 30 % more of the spectrum in the band at
+  /// the end. A spectral *shift*, not entrainment: closing the eyes alone
+  /// raises alpha. Whether the EEG followed the stimulus is
+  /// [frequencyFollowing]. Null when either third has no frames.
+  double? bandShift(String band) {
     final withFrames = rows.where((r) => r.frames > 0).toList();
     if (withFrames.length < 6) return null;
     final third = withFrames.length ~/ 3;
@@ -452,6 +534,7 @@ class EegSessionCapture {
   }
 
   Map<String, dynamic> toJson() => {
+        'schema': currentSchema,
         'id': id,
         'practiceSessionId': practiceSessionId,
         'deviceType': deviceType.name,
@@ -468,7 +551,9 @@ class EegSessionCapture {
         'alerts': alerts.map((a) => a.toJson()).toList(),
       };
 
-  factory EegSessionCapture.fromJson(Map<String, dynamic> j) => EegSessionCapture(
+  factory EegSessionCapture.fromJson(Map<String, dynamic> j) {
+    final legacy = ((j['schema'] as num?)?.toInt() ?? 1) < 2;
+    return EegSessionCapture(
         id: j['id'] as String,
         practiceSessionId: j['practiceSessionId'] as String?,
         deviceType: EegDeviceType.values.byName(j['deviceType'] as String),
@@ -479,7 +564,7 @@ class EegSessionCapture {
         endedAt: DateTime.parse(j['endedAt'] as String),
         rows: [
           for (final r in (j['rows'] as List?) ?? const [])
-            EegCaptureRow.fromList((r as List).cast<dynamic>()),
+            EegCaptureRow.fromList((r as List).cast<dynamic>(), legacy: legacy),
         ],
         context: [
           for (final c in (j['context'] as List?) ?? const [])
@@ -502,4 +587,5 @@ class EegSessionCapture {
             EegAlertNote.fromJson(Map<String, dynamic>.from(a as Map)),
         ],
       );
+  }
 }

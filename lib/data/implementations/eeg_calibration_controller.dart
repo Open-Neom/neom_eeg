@@ -15,7 +15,10 @@ import 'eeg_calibration_builder.dart';
 ///
 /// The routine is two timed phases — eyes open on a fixed point, then eyes
 /// closed — during which every band-power frame and raw sample the hub
-/// publishes is folded into an [EegCalibrationBuilder]. The result is what
+/// publishes is handed to an [EegCalibrationBuilder], except during the
+/// first `settle` seconds of each phase: alpha takes a moment to rise after
+/// the eyes close, and the first seconds of eyes-open carry the blinks of
+/// having just opened them. The result is what
 /// turns fixed thresholds into personal ones everywhere else in the
 /// module (watcher z-scores, hypofrontality, entrainment).
 ///
@@ -57,6 +60,7 @@ class EegCalibrationController extends SintController {
   StreamSubscription<EegConnectionState>? _connectionSub;
   Timer? _timer;
   Completer<EegCalibration?>? _running;
+  DateTime _phaseStartedAt = DateTime.now();
   Box<Map>? _box;
 
   bool get isRunning => _running != null && !_running!.isCompleted;
@@ -93,6 +97,7 @@ class EegCalibrationController extends SintController {
     Duration eyesOpen = const Duration(seconds: 60),
     Duration eyesClosed = const Duration(seconds: 30),
     bool includeEyesClosed = true,
+    Duration settle = const Duration(seconds: 3),
   }) async {
     if (hub.connectionState != EegConnectionState.streaming) {
       throw const EegException('Conecta un headset antes de calibrar');
@@ -107,12 +112,16 @@ class EegCalibrationController extends SintController {
     progress.value = 0;
     _running = Completer<EegCalibration?>();
 
+    bool settling() => DateTime.now().difference(_phaseStartedAt) < settle;
     _subs.addAll([
       hub.bandPowerStream.listen((frame) {
+        if (settling()) return;
         _builder.addFrame(phase.value, frame);
         frames.value = _builder.eyesOpenFrames + _builder.eyesClosedFrames;
       }),
-      hub.rawStream.listen((s) => _builder.addRaw(phase.value, s)),
+      hub.rawStream.listen((s) {
+        if (!settling()) _builder.addRaw(phase.value, s);
+      }),
     ]);
 
     final started = DateTime.now();
@@ -165,6 +174,7 @@ class EegCalibrationController extends SintController {
 
   void _enterPhase(EegCalibrationPhase p, Duration length) {
     phase.value = p;
+    _phaseStartedAt = DateTime.now();
     remainingSeconds.value = _ceilSeconds(length);
   }
 

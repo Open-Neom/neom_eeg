@@ -1,9 +1,11 @@
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hive/hive.dart';
 import 'package:neom_eeg/data/hub/eeg_driver_registry.dart';
 import 'package:neom_eeg/data/hub/eeg_hub.dart';
+import 'package:neom_eeg/data/implementations/eeg_calibration_builder.dart';
 import 'package:neom_eeg/data/implementations/eeg_session_capture_controller.dart';
 import 'package:neom_eeg/data/implementations/eeg_watch_controller.dart';
 import 'package:neom_eeg/domain/enums/eeg_device_type.dart';
@@ -38,32 +40,29 @@ List<EegBandPower> insight({double t7 = 10, double t8 = 10, double beta = 3}) =>
       bp('AF4', betaLow: beta),
     ];
 
-EegCalibration calibration({double restingT7 = 10, double restingT8 = 10}) => EegCalibration(
-      deviceType: EegDeviceType.emotivInsight,
-      baselines: {
-        for (final band in ['delta', 'theta', 'alpha', 'betaLow', 'betaHigh', 'gamma'])
-          band: {
-            for (final ch in EegChannelCatalog.emotivInsight)
-              ch: switch (band) {
-                'alpha' => ch == 'T7' ? restingT7 : ch == 'T8' ? restingT8 : 10.0,
-                'theta' => 2.0,
-                'betaLow' => 3.0,
-                'betaHigh' => 1.0,
-                'gamma' => 0.5,
-                _ => 1.0,
-              },
-          },
-      },
-      deviations: {
-        for (final band in ['delta', 'theta', 'alpha', 'betaLow', 'betaHigh', 'gamma'])
-          band: {for (final ch in EegChannelCatalog.emotivInsight) ch: band == 'alpha' ? 2.0 : 1.0},
-      },
-      indexMeans: {EegCalibration.frontalActivationIndex: 4 / 12},
-      indexDeviations: {EegCalibration.frontalActivationIndex: 0.05},
-      noiseFloor: 5,
-      artifactThreshold: 20,
-      calibratedAt: DateTime(2026, 9, 20),
-    );
+/// Resting baseline built the way the routine builds it: 60 s at 8 Hz of
+/// [insight]-like frames with ±12 % log-normal jitter per channel and band.
+EegCalibration calibration({double restingT7 = 10, double restingT8 = 10}) {
+  final rnd = Random(99);
+  double j() => pow(10, 0.05 * (rnd.nextDouble() * 2 - 1)).toDouble();
+  final b = EegCalibrationBuilder();
+  for (var i = 0; i < 480; i++) {
+    b.addFrame(EegCalibrationPhase.eyesOpen, [
+      for (final ch in EegChannelCatalog.emotivInsight)
+        EegBandPower(
+          channel: ch,
+          delta: 1 * j(),
+          theta: 2 * j(),
+          alpha: (ch == 'T7' ? restingT7 : ch == 'T8' ? restingT8 : 10.0) * j(),
+          betaLow: 3 * j(),
+          betaHigh: 1 * j(),
+          gamma: 0.5 * j(),
+          timestamp: DateTime(2026, 9, 20),
+        ),
+    ]);
+  }
+  return b.build(deviceType: EegDeviceType.emotivInsight, eyesOpenSeconds: 60, eyesClosedSeconds: 0);
+}
 
 void main() {
   late Directory dir;
@@ -143,12 +142,20 @@ void main() {
       expect(watch.holding.containsKey('asymmetry_sustained'), isFalse);
     });
 
-    test('a brief imbalance that releases never fires', () async {
+    test('an imbalance that really ends restarts the count', () async {
       await feed(insight(t7: 16, t8: 8), seconds: 6);
-      await feed(insight(), seconds: 1);
+      await feed(insight(), seconds: 6); // smoothed value falls below 0.15
       expect(watch.holding, isEmpty);
       await feed(insight(t7: 16, t8: 8), seconds: 6);
       expect(watch.alerts, isEmpty);
+    });
+
+    test('a single balanced frame does not restart a sustained episode', () async {
+      await feed(insight(t7: 16, t8: 8), seconds: 6);
+      await feed(insight(), seconds: 1); // one dip: smoothed stays over 0.15
+      expect(watch.holding.keys, contains('asymmetry_sustained'));
+      await feed(insight(t7: 16, t8: 8), seconds: 5);
+      expect(watch.alerts.map((a) => a.rule.id), contains('asymmetry_sustained'));
     });
 
     test('a long episode is re-marked every cooldown, not every frame', () async {
@@ -163,8 +170,38 @@ void main() {
     test('release clears the active state', () async {
       await feed(insight(t7: 16, t8: 8), seconds: 11);
       expect(watch.active, isNotEmpty);
-      await feed(insight(), seconds: 1);
+      await feed(insight(), seconds: 6);
       expect(watch.active, isEmpty);
+    });
+  });
+
+  group('noisy signal (8 Hz frames, like Cortex pow)', () {
+    /// Frames with ±25 % multiplicative alpha noise per channel — what a
+    /// ⅛ s band-power frame looks like — for [seconds] at 8 Hz.
+    Future<void> feedNoisy({required double t7, required double t8, required int seconds}) async {
+      final rnd = Random(7);
+      double g() => sqrt(-2 * log(1 - rnd.nextDouble())) * cos(2 * pi * rnd.nextDouble());
+      for (var i = 0; i < seconds * 8; i++) {
+        now = now.add(const Duration(milliseconds: 125));
+        driver.bandPower([
+          for (final ch in EegChannelCatalog.emotivInsight)
+            bp(ch, alpha: (ch == 'T7' ? t7 : ch == 'T8' ? t8 : 10) * (1 + 0.25 * g())),
+        ]);
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+
+    test('a true 0.33 asymmetry fires despite frame noise', () async {
+      // Before smoothing this fired 0 times in 120 s: 21 % of frames dipped
+      // under 0.2 and each dip restarted the 10 s count.
+      await feedNoisy(t7: 16, t8: 8, seconds: 30);
+      expect(watch.alerts.where((a) => a.rule.id == 'asymmetry_sustained'), isNotEmpty);
+    });
+
+    test('balanced but noisy temporal alpha never fires', () async {
+      // Per frame, 29 % of these exceed |0.2|; smoothed, none is sustained.
+      await feedNoisy(t7: 10, t8: 10, seconds: 120);
+      expect(watch.alerts.where((a) => a.rule.id == 'asymmetry_sustained'), isEmpty);
     });
   });
 
@@ -172,6 +209,11 @@ void main() {
     test('z-scored rules stay dormant without a calibration', () async {
       final betaRule = watch.rules.firstWhere((r) => r.id == 'beta_over_baseline');
       expect(watch.isArmed(betaRule), isFalse);
+      // The coherence metric is dormant too: no raw EEG went through the hub.
+      expect(
+        watch.isArmed(const EegWatchRule(id: 'c', label: 'c', metric: EegWatchMetric.coherence, threshold: 0.5)),
+        isFalse,
+      );
       await feed(insight(beta: 30), seconds: 15);
       expect(watch.alerts.where((a) => a.rule.id == 'beta_over_baseline'), isEmpty);
       expect(watch.indices.value.isCalibrated, isFalse);
@@ -179,8 +221,8 @@ void main() {
 
     test('beta 2σ over the resting level fires once calibrated', () async {
       cal = calibration();
-      // betaLow 3 → 6 on every channel: whole-head beta 7 vs baseline 4,
-      // sd(beta) = sqrt(1² + 1²) → z = 3 / 1.414 = 2.12 > 2.
+      // betaLow 3 → 6 on every channel: log₁₀(7/4) = 0.24 against a
+      // resting log-SD near 0.03 — far beyond 2σ of the whole-head z.
       await feed(insight(beta: 6), seconds: 11);
       final betaAlerts = watch.alerts.where((a) => a.rule.id == 'beta_over_baseline').toList();
       expect(betaAlerts.length, 1);
@@ -207,7 +249,8 @@ void main() {
       final hypo = watch.alerts.where((a) => a.rule.id == 'hypofrontality').toList();
       expect(hypo.length, 1);
       expect(hypo.first.severity, EegAlertSeverity.info);
-      expect(watch.indices.value.hypofrontality, closeTo(0.75, 1e-9));
+      // Frontal β/(α+θ): 1/12 now against a resting geometric mean ≈ 4/12.
+      expect(watch.indices.value.hypofrontality, closeTo(0.75, 0.03));
     });
   });
 
@@ -306,6 +349,51 @@ void main() {
       expect(watch.alerts.map((a) => a.rule.id), ['alpha_share']);
     });
 
+    test('an asymmetry rule measures its own band', () async {
+      watch.setRules([
+        const EegWatchRule(
+          id: 'theta_asym',
+          label: 'Asimetría theta',
+          metric: EegWatchMetric.asymmetry,
+          band: 'theta',
+          threshold: 0.2,
+          smoothing: Duration.zero,
+          sustain: Duration(seconds: 3),
+          autoMarker: false,
+        ),
+      ]);
+      // Alpha is imbalanced, theta balanced: a theta rule must stay quiet.
+      await feed(insight(t7: 16, t8: 8), seconds: 5);
+      expect(watch.alerts, isEmpty);
+      // Theta imbalanced on T7: now it fires.
+      final thetaImbalance = [
+        bp('AF3'), bp('T7').copyWithTheta(6), bp('Pz'), bp('T8').copyWithTheta(2), bp('AF4'),
+      ];
+      await feed(thetaImbalance, seconds: 5);
+      expect(watch.alerts.map((a) => a.rule.id), ['theta_asym']);
+    });
+
+    test('losing an electrode of the pair restarts the episode on the new pair', () async {
+      // Both T7/T8 and AF3/AF4 imbalanced.
+      final both = [
+        bp('AF3', alpha: 16), bp('T7', alpha: 16), bp('Pz'), bp('T8', alpha: 8), bp('AF4', alpha: 8),
+      ];
+      await feed(both, seconds: 8);
+      expect(watch.holding.keys, contains('asymmetry_sustained'));
+
+      driver.status(EegDeviceStatus(
+        contactQuality: const {'AF3': 1, 'T7': 0, 'Pz': 1, 'T8': 1, 'AF4': 1},
+        timestamp: now,
+      ));
+      await Future<void>.delayed(Duration.zero);
+      // 8 s on T7/T8 + 5 s on AF3/AF4 is not 10 s on either.
+      await feed(both, seconds: 5);
+      expect(watch.alerts.where((a) => a.rule.id == 'asymmetry_sustained'), isEmpty);
+      await feed(both, seconds: 6);
+      final fired = watch.alerts.firstWhere((a) => a.rule.id == 'asymmetry_sustained');
+      expect(fired.pair, 'AF3/AF4 (prefrontal)');
+    });
+
     test('a reconnection resets sustain timers', () async {
       await feed(insight(t7: 16, t8: 8), seconds: 8);
       expect(watch.holding, isNotEmpty);
@@ -328,4 +416,17 @@ void main() {
       await sub.cancel();
     });
   });
+}
+
+extension on EegBandPower {
+  EegBandPower copyWithTheta(double theta) => EegBandPower(
+        channel: channel,
+        delta: delta,
+        theta: theta,
+        alpha: alpha,
+        betaLow: betaLow,
+        betaHigh: betaHigh,
+        gamma: gamma,
+        timestamp: timestamp,
+      );
 }

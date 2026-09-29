@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:sint/sint.dart';
 
 import '../../data/implementations/eeg_calibration_controller.dart';
+import '../../data/implementations/eeg_coherence_tracker.dart';
 import '../../data/implementations/eeg_connection_controller.dart';
 import '../../data/implementations/eeg_watch_controller.dart';
 import '../../domain/enums/eeg_connection_state.dart';
@@ -124,8 +125,10 @@ class _ConnectedDashboardState extends State<_ConnectedDashboard> {
   List<EegBandPower> _frame = const [];
   EegMentalState? _mental;
   String? _selectedChannel;
+  EegPairCoherence? _coherence;
   StreamSubscription<List<EegBandPower>>? _bandSub;
   StreamSubscription<EegMentalState>? _mentalSub;
+  StreamSubscription<EegPairCoherence>? _coherenceSub;
 
   @override
   void initState() {
@@ -141,6 +144,7 @@ class _ConnectedDashboardState extends State<_ConnectedDashboard> {
       _cancel();
       _frame = const [];
       _mental = null;
+      _coherence = null;
       _selectedChannel = null;
       _listen();
     }
@@ -154,11 +158,15 @@ class _ConnectedDashboardState extends State<_ConnectedDashboard> {
     _mentalSub = provider.mentalStateStream.listen((m) {
       if (mounted) setState(() => _mental = m);
     });
+    _coherenceSub = widget.controller.hub?.coherenceStream.listen((c) {
+      if (mounted) setState(() => _coherence = c);
+    });
   }
 
   void _cancel() {
     _bandSub?.cancel();
     _mentalSub?.cancel();
+    _coherenceSub?.cancel();
   }
 
   @override
@@ -241,6 +249,7 @@ class _ConnectedDashboardState extends State<_ConnectedDashboard> {
         final balance = EegHemisphericBalance(
           frame: _frame,
           excluded: excluded,
+          coherence: _coherence,
         );
 
         final metrics = EegMetricsRow(

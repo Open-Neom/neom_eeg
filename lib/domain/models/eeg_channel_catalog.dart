@@ -12,7 +12,9 @@ class EegHemisphericPair {
 
   const EegHemisphericPair(this.left, this.right, this.region);
 
-  bool get isTemporal => region == 'temporal';
+  /// Covers the temporal lobe: T7/T8 proper or the temporoparietal
+  /// TP7/TP8, TP9/TP10 (Muse) — what the Cyberneom T7/T8 protocol accepts.
+  bool get isTemporal => region == 'temporal' || region == 'temporoparietal';
 
   @override
   String toString() => '$left/$right ($region)';
@@ -124,7 +126,9 @@ class EegChannelCatalog {
     'T8', 'FT10', 'FC6', 'C4', 'FC2', 'F4', 'F8', 'Fp2',
   ];
 
-  static const List<String> emotivMn8 = ['AF7', 'AF8'];
+  /// In-ear electrodes; Cortex and Emotiv's Unity plugin report them as
+  /// T7/T8 (`unity-plugin/Src/Types.cs`, `mn8List`). Shared with the MW20.
+  static const List<String> emotivMn8 = ['T7', 'T8'];
 
   static const List<String> muse = ['TP9', 'AF7', 'AF8', 'TP10'];
 
@@ -150,7 +154,7 @@ class EegChannelCatalog {
           emotivEpoc,
         EegDeviceType.emotivEpocFlex => emotivEpocFlex,
         EegDeviceType.emotivInsight => emotivInsight,
-        EegDeviceType.emotivMn8 => emotivMn8,
+        EegDeviceType.emotivMn8 || EegDeviceType.emotivMw20 => emotivMn8,
         EegDeviceType.muse => muse,
         EegDeviceType.brainbit => brainbit,
         EegDeviceType.openbci => openbciCyton,
@@ -190,12 +194,12 @@ class EegChannelCatalog {
 
   /// Homologous pairs in priority order for hemispheric metrics. Temporal
   /// first because that is what the Cyberneom protocol tracks; the rest lets
-  /// a headset without temporal electrodes (MN8, Ganglion, MindWave…) still
+  /// a headset without temporal electrodes (Ganglion, a Cyton montage…) still
   /// report a left/right balance from whatever it has.
   static const List<EegHemisphericPair> hemisphericPairs = [
     EegHemisphericPair('T7', 'T8', 'temporal'),
-    EegHemisphericPair('TP9', 'TP10', 'temporal'),
-    EegHemisphericPair('TP7', 'TP8', 'temporal'),
+    EegHemisphericPair('TP9', 'TP10', 'temporoparietal'),
+    EegHemisphericPair('TP7', 'TP8', 'temporoparietal'),
     EegHemisphericPair('FT7', 'FT8', 'frontotemporal'),
     EegHemisphericPair('F7', 'F8', 'frontotemporal'),
     EegHemisphericPair('FC5', 'FC6', 'frontocentral'),
@@ -284,17 +288,15 @@ class EegChannelCatalog {
     return r == 'parietal' || r == 'parieto-occipital' || r == 'occipital';
   }
 
-  static bool isTemporal(String label) => regionOf(label) == 'temporal';
+  /// Temporal lobe coverage, as [EegHemisphericPair.isTemporal] reads it.
+  static bool isTemporal(String label) {
+    final r = regionOf(label);
+    return r == 'temporal' || r == 'temporoparietal';
+  }
 
   /// Whether a channel set covers the temporal lobes (T7/T8 or the
   /// mastoid-adjacent TP9/TP10), which the Cyberneom epilepsy protocol
   /// relies on for hemispheric asymmetry.
-  static bool hasTemporalCoverage(Iterable<String> labels) {
-    final upper = labels.map((l) => l.toUpperCase()).toSet();
-    final left = upper.contains('T7') || upper.contains('TP9') ||
-        upper.contains('T3');
-    final right = upper.contains('T8') || upper.contains('TP10') ||
-        upper.contains('T4');
-    return left && right;
-  }
+  static bool hasTemporalCoverage(Iterable<String> labels) =>
+      availablePairs(labels).any((p) => p.isTemporal);
 }

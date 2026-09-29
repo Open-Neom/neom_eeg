@@ -9,23 +9,44 @@ import 'eeg_channel_catalog.dart';
 /// Produced by the calibration routine (eyes open, then eyes closed) and
 /// consumed by everything that needs a *personal* threshold instead of a
 /// fixed one: the watcher's band z-scores, the hypofrontality index, the
-/// entrainment score of a session. Band values are in the same units the
-/// headset (or the hub's deriver) publishes, so a z-score compares like
-/// with like.
+/// asymmetry rule.
 ///
-/// `baselines` / `deviations` are `band → channel → value` over the
-/// eyes-open phase. Besides the six bands they carry a `raw` entry: the
-/// DC level and standard deviation of the raw signal per channel, which
-/// artifact detection reads. `eyesClosed` holds the band means of the
-/// eyes-closed phase when it ran; `alphaReactivity` compares the two.
+/// **Statistics are in log₁₀ power.** Band power is heavy-tailed (a blink
+/// multiplies frontal delta by ten), so a mean ± SD of raw power is
+/// dominated by a few frames; in log space it is close to Gaussian and a
+/// z-score means what it says.
+///
+/// **Whole-head z is in real σ.** [headZ] averages the per-channel z of the
+/// electrodes present in both the live frame and the calibration, then
+/// divides by [headDeviations] — the spread that same average showed at
+/// rest. Channels are correlated (shared reference, volume conduction), so
+/// neither "per-channel σ" nor "σ/√n" is right; measuring it is.
+///
+/// Tables are `band → channel → value`. `beta` (low + high) has its own
+/// entries in the log tables. [baselines] / [deviations] keep the linear
+/// means and SDs (band shares, alpha reactivity) plus a `raw` entry: the DC
+/// level and noise of the raw signal per channel, for artifact detection.
 class EegCalibration {
+  /// Bump when the statistics change meaning; older baselines stay
+  /// readable but [supportsZ] turns false until the user recalibrates.
+  static const currentSchema = 2;
+
   static const bands = ['delta', 'theta', 'alpha', 'betaLow', 'betaHigh', 'gamma'];
+
+  /// Bands with log statistics (the six plus merged `beta`).
+  static const statBands = [...bands, 'beta'];
   static const rawKey = 'raw';
 
-  /// Keys of [indexMeans] / [indexDeviations].
+  /// Key of [indexMeans] / [indexDeviations]: frontal β/(α+θ), in log₁₀.
   static const frontalActivationIndex = 'frontalActivation';
+
+  /// Prefix of the asymmetry indices (linear, `-1..1`), per band.
   static const asymmetryIndexPrefix = 'asymmetry:';
 
+  /// Floor for log₁₀ of a power value (Emotiv reports no delta: 0).
+  static const _logFloor = 1e-12;
+
+  final int schemaVersion;
   final String id;
 
   /// Whoever the host says was wearing the headset; null for a device-only
@@ -34,23 +55,32 @@ class EegCalibration {
   final EegDeviceType? deviceType;
   final List<String> channels;
 
-  /// `band → channel → mean` during eyes-open rest, plus [rawKey].
+  /// Linear `band → channel → mean` during eyes-open rest, plus [rawKey].
   final Map<String, Map<String, double>> baselines;
 
-  /// `band → channel → standard deviation` during eyes-open rest, plus [rawKey].
+  /// Linear `band → channel → SD` during eyes-open rest, plus [rawKey].
   final Map<String, Map<String, double>> deviations;
 
-  /// `band → channel → mean` during eyes-closed rest; empty when the phase
-  /// was skipped.
+  /// Linear `band → channel → mean` during eyes-closed rest; empty when the
+  /// phase was skipped.
   final Map<String, Map<String, double>> eyesClosed;
 
-  /// Whole-head indices at rest (eyes open): `frontalActivation`,
-  /// `asymmetry:<band>` for the best pair… mean and standard deviation, so
-  /// the watcher can z-score them too.
+  /// `band → channel → mean of log₁₀(power)` at rest (eyes open).
+  final Map<String, Map<String, double>> logMeans;
+
+  /// `band → channel → SD of log₁₀(power)` at rest (eyes open).
+  final Map<String, Map<String, double>> logDeviations;
+
+  /// `band →` SD of the channel-averaged z at rest — the σ of the
+  /// whole-head quantity [headZ] reports.
+  final Map<String, double> headDeviations;
+
+  /// Whole-head indices at rest: [frontalActivationIndex] (log₁₀) and
+  /// `asymmetry:<band>` for the best pair (linear).
   final Map<String, double> indexMeans;
   final Map<String, double> indexDeviations;
 
-  /// Mean standard deviation of the raw signal around its DC level (µV).
+  /// Mean SD of the raw signal around its DC level (µV).
   final double noiseFloor;
 
   /// Raw excursion from the DC level considered an artifact (µV).
@@ -59,10 +89,14 @@ class EegCalibration {
   final double eyesOpenSeconds;
   final double eyesClosedSeconds;
 
-  /// Band-power frames the statistics were computed from.
+  /// Band-power frames the statistics were computed from (kept ones).
   final int frames;
 
+  /// Frames discarded as artifacts (blinks, jaw, movement).
+  final int rejectedFrames;
+
   const EegCalibration({
+    this.schemaVersion = currentSchema,
     this.id = '',
     this.subjectId,
     this.deviceType,
@@ -70,6 +104,9 @@ class EegCalibration {
     required this.baselines,
     this.deviations = const {},
     this.eyesClosed = const {},
+    this.logMeans = const {},
+    this.logDeviations = const {},
+    this.headDeviations = const {},
     this.indexMeans = const {},
     this.indexDeviations = const {},
     required this.noiseFloor,
@@ -78,13 +115,23 @@ class EegCalibration {
     this.eyesOpenSeconds = 0,
     this.eyesClosedSeconds = 0,
     this.frames = 0,
+    this.rejectedFrames = 0,
   });
+
+  static double log10(double power) =>
+      math.log(power < _logFloor ? _logFloor : power) / math.ln10;
 
   /// Storage key for one subject on one model.
   static String keyFor(String? subjectId, EegDeviceType? type) =>
       '${subjectId ?? 'local'}|${type?.name ?? 'any'}';
 
   String get key => keyFor(subjectId, deviceType);
+
+  bool get isCurrentSchema => schemaVersion >= currentSchema;
+
+  /// Whether z-scored rules can use this baseline. False for baselines of
+  /// an older schema (they were computed on linear power) — recalibrate.
+  bool get supportsZ => isCurrentSchema && logMeans.isNotEmpty && headDeviations.isNotEmpty;
 
   bool get hasEyesClosed => eyesClosed.isNotEmpty;
 
@@ -96,8 +143,7 @@ class EegCalibration {
   /// medication, so a baseline should be refreshed regularly.
   bool isStale({Duration maxAge = const Duration(days: 30)}) => age > maxAge;
 
-  /// Whether every one of [labels] has a baseline — i.e. this calibration
-  /// was taken on a layout that includes the connected headset's channels.
+  /// Whether every one of [labels] has a baseline.
   bool covers(Iterable<String> labels) {
     final have = baselines['alpha']?.keys.map((c) => c.toUpperCase()).toSet() ?? const {};
     return labels.every((l) => have.contains(l.toUpperCase()));
@@ -107,27 +153,66 @@ class EegCalibration {
 
   double? deviation(String band, String channel) => _lookup(deviations, band, channel);
 
-  /// Mean of [band] across [channels] (all calibrated channels by default).
-  double? meanBaseline(String band, {Iterable<String>? channels}) =>
-      _meanOver(baselines, band, channels);
-
-  /// Mean standard deviation of [band] across channels. It approximates the
-  /// spread of the whole-head average the watcher tracks; per-channel
-  /// values are available through [deviation].
-  double? meanDeviation(String band, {Iterable<String>? channels}) =>
-      _meanOver(deviations, band, channels, quadrature: true);
-
-  /// How many standard deviations [value] sits from the resting mean of
-  /// [band], whole-head or for one [channel]. Null without deviations or
-  /// when the deviation is zero.
-  double? zScore(String band, double value, {String? channel}) {
-    final mean = channel == null ? meanBaseline(band) : baseline(band, channel);
-    final sd = channel == null ? meanDeviation(band) : deviation(band, channel);
-    if (mean == null || sd == null || sd <= 0) return null;
-    return (value - mean) / sd;
+  /// Linear mean of [band] across [channels] (all calibrated by default).
+  double? meanBaseline(String band, {Iterable<String>? channels}) {
+    if (band == 'beta') {
+      final lo = meanBaseline('betaLow', channels: channels);
+      final hi = meanBaseline('betaHigh', channels: channels);
+      return lo == null || hi == null ? null : lo + hi;
+    }
+    final row = baselines[band];
+    if (row == null || row.isEmpty) return null;
+    final picks = channels == null
+        ? row.values.toList()
+        : [for (final c in channels) ?_lookup(baselines, band, c)];
+    if (picks.isEmpty) return null;
+    return picks.fold(0.0, (a, b) => a + b) / picks.length;
   }
 
-  /// z-score of a whole-head index recorded in [indexMeans].
+  /// z of one channel's [power] in [band] against its resting log power.
+  double? channelZ(String band, String channel, double power) {
+    if (!supportsZ) return null;
+    final mean = _lookup(logMeans, band, channel);
+    final sd = _lookup(logDeviations, band, channel);
+    if (mean == null || sd == null || sd <= 1e-9) return null;
+    return (log10(power) - mean) / sd;
+  }
+
+  /// Whole-head z of [band] for a live [frame], in σ of the whole-head
+  /// quantity: mean per-channel z over the electrodes present in both the
+  /// frame and the calibration, divided by [headDeviations]. Null when no
+  /// electrode overlaps or the band was flat at rest (Emotiv delta).
+  double? headZ(String band, Iterable<EegBandPower> frame) {
+    if (!supportsZ) return null;
+    final sd = headDeviations[band];
+    if (sd == null || sd <= 1e-9) return null;
+    var sum = 0.0;
+    var n = 0;
+    for (final b in frame) {
+      final z = channelZ(band, b.channel, _bandOf(b, band));
+      if (z == null) continue;
+      sum += z;
+      n++;
+    }
+    return n == 0 ? null : (sum / n) / sd;
+  }
+
+  /// Resting frontal activation β/(α+θ) as a ratio (geometric mean).
+  double? get frontalActivationRest {
+    final m = indexMeans[frontalActivationIndex];
+    return m == null ? null : math.pow(10, m).toDouble();
+  }
+
+  /// z of a live frontal activation ratio against rest (log domain).
+  double? frontalActivationZ(double ratio) {
+    if (!supportsZ || ratio <= 0) return null;
+    final mean = indexMeans[frontalActivationIndex];
+    final sd = indexDeviations[frontalActivationIndex];
+    if (mean == null || sd == null || sd <= 1e-9) return null;
+    return (log10(ratio) - mean) / sd;
+  }
+
+  /// z of a linear index recorded in [indexMeans] (asymmetries).
   double? indexZ(String index, double value) {
     final mean = indexMeans[index];
     final sd = indexDeviations[index];
@@ -136,10 +221,9 @@ class EegCalibration {
   }
 
   /// Eyes-closed alpha ÷ eyes-open alpha over posterior electrodes (Pz, O1,
-  /// O2…), or over every channel when the headset has none. Healthy
-  /// resting alpha rises clearly with closed eyes (typically 1.5–3×); a
-  /// value near 1 means either poor contact or no alpha reactivity, and
-  /// the personal thresholds should be read with that in mind.
+  /// O2…), or over every channel when the headset has none. Healthy resting
+  /// alpha rises clearly with closed eyes (typically 1.5–3×); a value near 1
+  /// means poor contact or no alpha reactivity.
   double? get alphaReactivity {
     if (!hasEyesClosed) return null;
     final open = baselines['alpha'];
@@ -164,8 +248,7 @@ class EegCalibration {
     return means.map((b, v) => MapEntry(b, v / total));
   }
 
-  /// The resting spectrum as a band-power frame, one entry per channel, so
-  /// any index that takes a frame can be evaluated at baseline.
+  /// The resting spectrum as a band-power frame, one entry per channel.
   List<EegBandPower> get baselineFrame {
     final alpha = baselines['alpha'];
     if (alpha == null) return const [];
@@ -184,18 +267,17 @@ class EegCalibration {
     ];
   }
 
-  /// Resting asymmetry index of [band] between [left] and [right], so a
-  /// personal watcher can flag *changes* from the subject's habitual
-  /// balance rather than any imbalance.
+  /// Resting asymmetry index of [band] between [left] and [right], so the
+  /// watcher can flag *changes* from the subject's habitual balance.
   double? baselineAsymmetry(String band, String left, String right) {
-    final l = _bandBaseline(band, left);
-    final r = _bandBaseline(band, right);
+    final l = _linearBand(band, left);
+    final r = _linearBand(band, right);
     if (l == null || r == null) return null;
     final sum = l + r;
     return sum <= 0 ? 0.0 : (l - r) / sum;
   }
 
-  double? _bandBaseline(String band, String channel) {
+  double? _linearBand(String band, String channel) {
     if (band == 'beta') {
       final lo = baseline('betaLow', channel);
       final hi = baseline('betaHigh', channel);
@@ -203,6 +285,17 @@ class EegCalibration {
     }
     return baseline(band, channel);
   }
+
+  static double _bandOf(EegBandPower b, String band) => switch (band) {
+        'delta' => b.delta,
+        'theta' => b.theta,
+        'alpha' => b.alpha,
+        'betaLow' => b.betaLow,
+        'betaHigh' => b.betaHigh,
+        'beta' => b.betaLow + b.betaHigh,
+        'gamma' => b.gamma,
+        _ => 0.0,
+      };
 
   static double? _lookup(Map<String, Map<String, double>> table, String band, String channel) {
     final row = table[band];
@@ -215,29 +308,8 @@ class EegCalibration {
     return null;
   }
 
-  static double? _meanOver(
-    Map<String, Map<String, double>> table,
-    String band,
-    Iterable<String>? channels, {
-    bool quadrature = false,
-  }) {
-    if (band == 'beta') {
-      final lo = _meanOver(table, 'betaLow', channels, quadrature: quadrature);
-      final hi = _meanOver(table, 'betaHigh', channels, quadrature: quadrature);
-      if (lo == null || hi == null) return null;
-      // Means add linearly; independent deviations add in quadrature.
-      return quadrature ? math.sqrt(lo * lo + hi * hi) : lo + hi;
-    }
-    final row = table[band];
-    if (row == null || row.isEmpty) return null;
-    final picks = channels == null
-        ? row.values.toList()
-        : [for (final c in channels) if (_lookup(table, band, c) != null) _lookup(table, band, c)!];
-    if (picks.isEmpty) return null;
-    return picks.fold(0.0, (a, b) => a + b) / picks.length;
-  }
-
   EegCalibration copyWith({String? id, String? subjectId}) => EegCalibration(
+        schemaVersion: schemaVersion,
         id: id ?? this.id,
         subjectId: subjectId ?? this.subjectId,
         deviceType: deviceType,
@@ -245,6 +317,9 @@ class EegCalibration {
         baselines: baselines,
         deviations: deviations,
         eyesClosed: eyesClosed,
+        logMeans: logMeans,
+        logDeviations: logDeviations,
+        headDeviations: headDeviations,
         indexMeans: indexMeans,
         indexDeviations: indexDeviations,
         noiseFloor: noiseFloor,
@@ -253,9 +328,11 @@ class EegCalibration {
         eyesOpenSeconds: eyesOpenSeconds,
         eyesClosedSeconds: eyesClosedSeconds,
         frames: frames,
+        rejectedFrames: rejectedFrames,
       );
 
   Map<String, dynamic> toJson() => {
+        'schema': schemaVersion,
         'id': id,
         'subjectId': subjectId,
         'deviceType': deviceType?.name,
@@ -263,6 +340,9 @@ class EegCalibration {
         'baselines': baselines,
         'deviations': deviations,
         'eyesClosed': eyesClosed,
+        'logMeans': logMeans,
+        'logDeviations': logDeviations,
+        'headDeviations': headDeviations,
         'indexMeans': indexMeans,
         'indexDeviations': indexDeviations,
         'noiseFloor': noiseFloor,
@@ -271,11 +351,13 @@ class EegCalibration {
         'eyesOpenSeconds': eyesOpenSeconds,
         'eyesClosedSeconds': eyesClosedSeconds,
         'frames': frames,
+        'rejectedFrames': rejectedFrames,
       };
 
-  /// Reads the current schema and the original one (baselines, noise
-  /// floor, threshold, date only).
+  /// Reads every schema: the original one (baselines, noise floor,
+  /// threshold, date), v1 (linear statistics, no `schema` key) and v2.
   factory EegCalibration.fromJson(Map<String, dynamic> json) => EegCalibration(
+        schemaVersion: (json['schema'] as num?)?.toInt() ?? 1,
         id: json['id'] as String? ?? '',
         subjectId: json['subjectId'] as String?,
         deviceType: json['deviceType'] != null
@@ -285,6 +367,9 @@ class EegCalibration {
         baselines: _table(json['baselines']),
         deviations: _table(json['deviations']),
         eyesClosed: _table(json['eyesClosed']),
+        logMeans: _table(json['logMeans']),
+        logDeviations: _table(json['logDeviations']),
+        headDeviations: _row(json['headDeviations']),
         indexMeans: _row(json['indexMeans']),
         indexDeviations: _row(json['indexDeviations']),
         noiseFloor: (json['noiseFloor'] as num).toDouble(),
@@ -293,6 +378,7 @@ class EegCalibration {
         eyesOpenSeconds: (json['eyesOpenSeconds'] as num?)?.toDouble() ?? 0,
         eyesClosedSeconds: (json['eyesClosedSeconds'] as num?)?.toDouble() ?? 0,
         frames: (json['frames'] as num?)?.toInt() ?? 0,
+        rejectedFrames: (json['rejectedFrames'] as num?)?.toInt() ?? 0,
       );
 
   static Map<String, Map<String, double>> _table(Object? raw) => raw == null

@@ -11,12 +11,14 @@ import '../../domain/models/eeg_sample.dart';
 abstract class EegProcessorService {
   /// Extract frequency band powers from a window of raw samples.
   ///
-  /// Applies FFT to each channel and sums bins within standard
-  /// EEG frequency bands (delta, theta, alpha, beta, gamma).
+  /// Computes the spectrum of each channel and sums bins within the
+  /// standard EEG bands. Pass [sampleRate] when the driver knows it;
+  /// otherwise it is estimated from the sample timestamps.
   List<EegBandPower> extractBandPower(
     List<EegSample> samples,
-    List<EegChannelInfo> channels,
-  );
+    List<EegChannelInfo> channels, {
+    double? sampleRate,
+  });
 
   /// Detect whether a sample contains an artifact (blink, jaw clench).
   ///

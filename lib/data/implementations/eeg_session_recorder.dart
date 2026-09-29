@@ -12,6 +12,19 @@ import '../../domain/use_cases/eeg_device_service.dart';
 /// Saves session metadata, 1-second-averaged band power snapshots,
 /// and events (artifacts, state changes, markers). Supports CSV export.
 class EegSessionRecorder {
+  /// Session ids are also Hive keys and recording ids: two sessions
+  /// started within the same millisecond (a stop immediately followed by a
+  /// start) used to share one and overwrite each other. Microseconds, and
+  /// never less than the previous id.
+  static int _lastIdMicros = 0;
+
+  static String _nextId() {
+    var t = DateTime.now().microsecondsSinceEpoch;
+    if (t <= _lastIdMicros) t = _lastIdMicros + 1;
+    _lastIdMicros = t;
+    return '$t';
+  }
+
   static const _boxName = 'eeg_sessions';
 
   Box<Map>? _box;
@@ -37,7 +50,7 @@ class EegSessionRecorder {
     await init();
 
     _activeSession = EegSession(
-      id: DateTime.now().millisecondsSinceEpoch.toString(),
+      id: _nextId(),
       deviceType: deviceType,
       startTime: DateTime.now(),
     );

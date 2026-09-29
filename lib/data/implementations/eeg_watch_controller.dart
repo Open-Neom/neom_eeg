@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:sint/sint.dart';
 
@@ -13,6 +14,11 @@ import 'eeg_session_capture_controller.dart';
 /// Evaluates [EegWatchRule]s against every band-power frame the hub
 /// publishes and raises an [EegAlert] when a condition has held for the
 /// rule's `sustain`.
+///
+/// Each rule sees its metric smoothed (EMA, `smoothing`) and releases with
+/// `hysteresis`, so frame-to-frame noise does not reset the count; pair
+/// metrics start over when the analysis pair changes; every metric that
+/// takes a band uses the rule's own band.
 ///
 /// Thresholds are personal whenever a calibration is available: z-scored
 /// rules stay dormant without one, and the asymmetry rule measures the
@@ -33,7 +39,8 @@ class EegWatchController extends SintController {
   /// Where alerts are noted; resolved on every alert.
   final EegSessionCaptureController? Function()? capture;
 
-  /// Band the asymmetry/coherence indices are computed on.
+  /// Band of the hemispheric numbers in [indices] (display). Each rule
+  /// uses its own `band`.
   final String band;
 
   /// Minimum gap between two updates of [indices], to keep widget rebuilds
@@ -78,7 +85,7 @@ class EegWatchController extends SintController {
   final RxBool enabled = true.obs;
 
   final _alertController = StreamController<EegAlert>.broadcast();
-  final _since = <String, DateTime>{};
+  final _state = <String, _RuleState>{};
   final _lastFired = <String, DateTime>{};
   DateTime? _lastIndicesAt;
   final _subs = <StreamSubscription<dynamic>>[];
@@ -115,7 +122,7 @@ class EegWatchController extends SintController {
   void setRules(List<EegWatchRule> next) {
     rules.assignAll(next);
     final ids = next.map((r) => r.id).toSet();
-    _since.removeWhere((id, _) => !ids.contains(id));
+    _state.removeWhere((id, _) => !ids.contains(id));
     active.removeWhere((id) => !ids.contains(id));
     holding.removeWhere((id, _) => !ids.contains(id));
   }
@@ -137,7 +144,7 @@ class EegWatchController extends SintController {
 
   /// Forgets sustain timers and active states (new connection, new session).
   void reset() {
-    _since.clear();
+    _state.clear();
     _lastFired.clear();
     active.clear();
     holding.clear();
@@ -145,9 +152,14 @@ class EegWatchController extends SintController {
     _lastIndicesAt = null;
   }
 
-  /// Whether [rule] can fire right now (its metric is available).
-  bool isArmed(EegWatchRule rule) =>
-      rule.enabled && (!rule.needsCalibration || calibration?.call() != null);
+  /// Whether [rule] can fire right now (its metric is available): z rules
+  /// need a current-schema baseline, coherence needs raw EEG.
+  bool isArmed(EegWatchRule rule) {
+    if (!rule.enabled) return false;
+    if (rule.needsCalibration && !(calibration?.call()?.supportsZ ?? false)) return false;
+    if (rule.metric == EegWatchMetric.coherence && hub.lastCoherence == null) return false;
+    return true;
+  }
 
   // ── Evaluation ──────────────────────────────────────────────────────
 
@@ -160,9 +172,11 @@ class EegWatchController extends SintController {
   /// own clock; the controller calls it for every hub frame.
   void evaluate(List<EegBandPower> frame, {required DateTime at}) {
     final cal = calibration?.call();
+    final coherence = hub.lastCoherence;
     final idx = EegIndices.compute(
       frame,
       calibration: cal,
+      coherence: coherence != null && coherence.isFresh() ? coherence : null,
       band: band,
       excludedChannels: hub.excludedChannels.length,
       at: at,
@@ -174,17 +188,28 @@ class EegWatchController extends SintController {
 
     for (final rule in rules) {
       if (!rule.enabled) continue;
-      final value = valueFor(rule, idx, cal);
-      if (value == null) {
-        _release(rule.id);
-        continue;
-      }
-      if (!rule.holds(value)) {
+      final raw = valueFor(rule, frame, idx, cal);
+      if (raw == null) {
         _release(rule.id);
         continue;
       }
 
-      final since = _since.putIfAbsent(rule.id, () => at);
+      final st = _state.putIfAbsent(rule.id, _RuleState.new);
+      final pair = rule.metric.dependsOnPair ? idx.pair?.toString() : null;
+      if (st.pair != pair) {
+        // Another region now; an episode on T7/T8 does not continue on AF3/AF4.
+        _release(rule.id);
+        st.pair = pair;
+      }
+
+      final smoothed = st.smooth(raw, at, rule.smoothing);
+      final ok = st.since == null ? rule.holds(smoothed) : rule.continues(smoothed);
+      if (!ok) {
+        _release(rule.id, keepSmoothing: true);
+        continue;
+      }
+
+      final since = st.since ??= at;
       if (at.difference(since) < rule.sustain) {
         holding[rule.id] = since;
         continue;
@@ -195,26 +220,32 @@ class EegWatchController extends SintController {
       final last = _lastFired[rule.id];
       if (last != null && at.difference(last) < rule.cooldown) continue;
       _lastFired[rule.id] = at;
-      unawaited(_fire(rule, value: value, since: since, at: at));
+      unawaited(_fire(rule, value: smoothed, since: since, at: at, pair: pair));
     }
   }
 
-  /// The number a rule compares against its threshold, from [idx]; null
-  /// when the frame cannot provide it (no pair, no calibration, no frontal
-  /// electrode).
-  double? valueFor(EegWatchRule rule, EegLiveIndices idx, EegCalibration? cal) {
+  /// The per-frame number a rule compares against its threshold (before
+  /// smoothing); null when the frame cannot provide it (no pair, no raw
+  /// coherence, no calibration, no frontal electrode).
+  double? valueFor(
+    EegWatchRule rule,
+    List<EegBandPower> frame,
+    EegLiveIndices idx,
+    EegCalibration? cal,
+  ) {
     switch (rule.metric) {
       case EegWatchMetric.asymmetry:
-        final a = idx.asymmetry;
-        final pair = idx.pair;
-        if (a == null || pair == null) return null;
+        final a = EegIndices.asymmetry(frame, band: rule.band, pair: idx.pair);
+        if (a == null) return null;
         if (rule.personal && cal != null) {
-          final base = cal.baselineAsymmetry(rule.band, pair.left, pair.right);
-          if (base != null) return (a - base).abs();
+          final base = cal.baselineAsymmetry(rule.band, a.pair.left, a.pair.right);
+          if (base != null) return (a.index - base).abs();
         }
-        return a.abs();
+        return a.index.abs();
+      case EegWatchMetric.symmetry:
+        return EegIndices.symmetry(frame, band: rule.band, pair: idx.pair);
       case EegWatchMetric.coherence:
-        return idx.coherence;
+        return idx.pairCoherence?.of(rule.band);
       case EegWatchMetric.bandZ:
         return idx.z[rule.band];
       case EegWatchMetric.bandShare:
@@ -228,8 +259,12 @@ class EegWatchController extends SintController {
     }
   }
 
-  void _release(String id) {
-    _since.remove(id);
+  void _release(String id, {bool keepSmoothing = false}) {
+    final st = _state[id];
+    if (st != null) {
+      st.since = null;
+      if (!keepSmoothing) st.clearSmoothing();
+    }
     holding.remove(id);
     active.remove(id);
   }
@@ -239,6 +274,7 @@ class EegWatchController extends SintController {
     required double value,
     required DateTime since,
     required DateTime at,
+    String? pair,
   }) async {
     var markerAdded = false;
     String? recordingId;
@@ -257,6 +293,7 @@ class EegWatchController extends SintController {
               'value': value,
               'threshold': rule.threshold,
               'sustainedS': at.difference(since).inMilliseconds / 1000.0,
+              'pair': ?pair,
               'auto': true,
             },
           );
@@ -277,6 +314,7 @@ class EegWatchController extends SintController {
       firedAt: at,
       markerAdded: markerAdded,
       recordingId: recordingId,
+      pair: pair,
     );
     alerts.insert(0, alert);
     while (alerts.length > historyLength) {
@@ -284,5 +322,32 @@ class EegWatchController extends SintController {
     }
     if (!_alertController.isClosed) _alertController.add(alert);
     capture?.call()?.noteAlert(alert);
+  }
+}
+
+/// Smoothing and episode state of one rule.
+class _RuleState {
+  double? _ema;
+  DateTime? _lastAt;
+  DateTime? since;
+  String? pair;
+
+  /// Exponential moving average with time constant [tau], sampled at
+  /// irregular intervals (`α = 1 − e^(−Δt/τ)`).
+  double smooth(double value, DateTime at, Duration tau) {
+    final prev = _ema;
+    final last = _lastAt;
+    _lastAt = at;
+    if (prev == null || last == null || tau <= Duration.zero) {
+      return _ema = value;
+    }
+    final dt = at.difference(last).inMicroseconds / tau.inMicroseconds;
+    final alpha = dt <= 0 ? 0.0 : 1 - math.exp(-dt);
+    return _ema = prev + alpha * (value - prev);
+  }
+
+  void clearSmoothing() {
+    _ema = null;
+    _lastAt = null;
   }
 }

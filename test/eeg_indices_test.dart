@@ -1,5 +1,10 @@
+import 'dart:math';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:neom_eeg/data/implementations/eeg_calibration_builder.dart';
+import 'package:neom_eeg/data/implementations/eeg_coherence_tracker.dart';
 import 'package:neom_eeg/data/implementations/eeg_indices.dart';
+import 'package:neom_eeg/domain/enums/eeg_device_type.dart';
 import 'package:neom_eeg/domain/models/eeg_band_power.dart';
 import 'package:neom_eeg/domain/models/eeg_calibration.dart';
 import 'package:neom_eeg/domain/models/eeg_channel_catalog.dart';
@@ -46,6 +51,19 @@ void main() {
       expect(EegChannelCatalog.emotivInsight.where(EegChannelCatalog.isPosterior), ['Pz']);
       expect(EegChannelCatalog.muse.where(EegChannelCatalog.isFrontal), ['AF7', 'AF8']);
       expect(EegChannelCatalog.muse.where(EegChannelCatalog.isPosterior), isEmpty);
+      // TP9/TP10 are temporoparietal but count as temporal coverage.
+      expect(EegChannelCatalog.isTemporal('TP9'), isTrue);
+      expect(EegChannelCatalog.bestPair(EegChannelCatalog.muse)!.region, 'temporoparietal');
+      expect(EegChannelCatalog.bestPair(EegChannelCatalog.muse)!.isTemporal, isTrue);
+      expect(EegChannelCatalog.hasTemporalCoverage(EegChannelCatalog.muse), isTrue);
+    });
+
+    test('MN8 and MW20 are in-ear T7/T8', () {
+      expect(EegChannelCatalog.labelsFor(EegDeviceType.emotivMn8), ['T7', 'T8']);
+      expect(EegChannelCatalog.labelsFor(EegDeviceType.emotivMw20), ['T7', 'T8']);
+      expect(EegChannelCatalog.hasTemporalCoverage(EegChannelCatalog.emotivMn8), isTrue);
+      expect(EegChannelCatalog.hasTemporalCoverage(EegChannelCatalog.brainbit), isTrue); // T3/T4
+      expect(EegChannelCatalog.hasTemporalCoverage(EegChannelCatalog.openbciGanglion), isFalse);
     });
   });
 
@@ -83,48 +101,62 @@ void main() {
     test('compute without calibration has no z-scores', () {
       final idx = EegIndices.compute(insight, excludedChannels: 1);
       expect(idx.isCalibrated, isFalse);
-      expect(idx.coherence, closeTo(1 - 0.2, 1e-9));
+      // Power symmetry of alpha on T7/T8 (12 vs 8); no raw EEG → no
+      // spectral coherence is claimed.
+      expect(idx.symmetry, closeTo(1 - 0.2, 1e-9));
+      expect(idx.coherence, isNull);
       expect(idx.pair!.isTemporal, isTrue);
       expect(idx.excludedChannels, 1);
       expect(idx.hypofrontality, isNull);
     });
 
     test('compute with calibration yields z-scores and hypofrontality', () {
-      final cal = EegCalibration(
-        baselines: {
-          'alpha': {'AF3': 10, 'T7': 10, 'Pz': 10, 'T8': 10, 'AF4': 10},
-          'theta': {'AF3': 2, 'T7': 2, 'Pz': 2, 'T8': 2, 'AF4': 2},
-          'delta': {'AF3': 1, 'T7': 1, 'Pz': 1, 'T8': 1, 'AF4': 1},
-          'betaLow': {'AF3': 3, 'T7': 3, 'Pz': 3, 'T8': 3, 'AF4': 3},
-          'betaHigh': {'AF3': 1, 'T7': 1, 'Pz': 1, 'T8': 1, 'AF4': 1},
-          'gamma': {'AF3': 0.5, 'T7': 0.5, 'Pz': 0.5, 'T8': 0.5, 'AF4': 0.5},
-        },
-        deviations: {
-          'alpha': {'AF3': 2, 'T7': 2, 'Pz': 2, 'T8': 2, 'AF4': 2},
-          'theta': {'AF3': 1, 'T7': 1, 'Pz': 1, 'T8': 1, 'AF4': 1},
-          'delta': {'AF3': 1, 'T7': 1, 'Pz': 1, 'T8': 1, 'AF4': 1},
-          'betaLow': {'AF3': 1, 'T7': 1, 'Pz': 1, 'T8': 1, 'AF4': 1},
-          'betaHigh': {'AF3': 1, 'T7': 1, 'Pz': 1, 'T8': 1, 'AF4': 1},
-          'gamma': {'AF3': 0.1, 'T7': 0.1, 'Pz': 0.1, 'T8': 0.1, 'AF4': 0.1},
-        },
-        indexMeans: {EegCalibration.frontalActivationIndex: 4 / 12},
-        indexDeviations: {EegCalibration.frontalActivationIndex: 0.1},
-        noiseFloor: 5,
-        artifactThreshold: 20,
-        calibratedAt: DateTime(2026, 9, 20),
-      );
+      // Rest: every channel alpha 10·10^(±0.05), beta 4, theta 2.
+      final rnd = Random(5);
+      final b = EegCalibrationBuilder();
+      for (var i = 0; i < 300; i++) {
+        final j = pow(10, 0.05 * (rnd.nextDouble() * 2 - 1)).toDouble();
+        final k = pow(10, 0.05 * (rnd.nextDouble() * 2 - 1)).toDouble();
+        b.addFrame(EegCalibrationPhase.eyesOpen, [
+          for (final ch in EegChannelCatalog.emotivInsight)
+            bp(ch, alpha: 10 * j, betaLow: 3 * k, betaHigh: 1 * k, theta: 2 * j),
+        ]);
+      }
+      final cal = b.build(eyesOpenSeconds: 40, eyesClosedSeconds: 0);
 
-      // Whole-head alpha 14 vs baseline 10 with sd 2 → z = 2.
       final calm = [for (final ch in EegChannelCatalog.emotivInsight) bp(ch, alpha: 14)];
       final idx = EegIndices.compute(calm, calibration: cal);
-      expect(idx.z['alpha'], closeTo(2.0, 1e-9));
-      expect(idx.z['beta'], closeTo(0.0, 1e-9));
-      expect(idx.frontalActivationZ, closeTo(((4 / 16) - (4 / 12)) / 0.1, 1e-9));
-      expect(idx.hypofrontality, closeTo(((4 / 12) - (4 / 16)) / (4 / 12), 1e-9));
+      expect(idx.isCalibrated, isTrue);
+      expect(idx.z['alpha'], greaterThan(3)); // 14 vs 10, log-SD ≈ 0.03
+      expect(idx.z['beta']!.abs(), lessThan(1.5));
+      // Frontal β/(α+θ): rest 4/12, now 4/16 → 25 % lower.
+      expect(idx.hypofrontality, closeTo(1 - (4 / 16) / (4 / 12), 0.02));
+      expect(idx.frontalActivationZ, lessThan(-1));
 
       // More frontal beta than at rest → no hypofrontality (clamped at 0).
       final busy = [for (final ch in EegChannelCatalog.emotivInsight) bp(ch, betaLow: 10)];
       expect(EegIndices.compute(busy, calibration: cal).hypofrontality, 0.0);
+    });
+  });
+
+  group('coherence attached to indices', () {
+    test('only when the reading belongs to the same pair', () {
+      final frame = [bp('AF3'), bp('T7', alpha: 12), bp('Pz'), bp('T8', alpha: 8), bp('AF4')];
+      EegPairCoherence reading(EegHemisphericPair pair) => EegPairCoherence(
+            pair: pair,
+            msc: const {'alpha': 0.7},
+            imaginary: const {'alpha': 0.1},
+            thresholds: const {'alpha': 0.25},
+            window: const Duration(seconds: 8),
+            at: DateTime.now(),
+          );
+      final t = EegIndices.compute(frame, coherence: reading(EegChannelCatalog.hemisphericPairs.first));
+      expect(t.coherence, 0.7);
+      expect(t.coherenceSignificant, isTrue);
+      expect(t.imaginaryCoherence, 0.1);
+
+      final af = EegChannelCatalog.availablePairs(['AF3', 'AF4']).first;
+      expect(EegIndices.compute(frame, coherence: reading(af)).coherence, isNull);
     });
   });
 
@@ -140,7 +172,8 @@ void main() {
       expect(cal.hasDeviations, isFalse);
       expect(cal.hasEyesClosed, isFalse);
       expect(cal.alphaReactivity, isNull);
-      expect(cal.zScore('alpha', 1), isNull);
+      expect(cal.supportsZ, isFalse);
+      expect(cal.headZ('alpha', [bp('AF3')]), isNull);
       expect(cal.key, 'local|any');
     });
 
@@ -152,7 +185,7 @@ void main() {
         baselines: {'alpha': {'AF3': 10, 'Pz': 12}},
         deviations: {'alpha': {'AF3': 2, 'Pz': 3}},
         eyesClosed: {'alpha': {'AF3': 15, 'Pz': 30}},
-        indexMeans: {'frontalActivation': 0.4},
+        indexMeans: {'frontalActivation': -0.4},
         indexDeviations: {'frontalActivation': 0.05},
         noiseFloor: 4,
         artifactThreshold: 16,
@@ -167,7 +200,8 @@ void main() {
       expect(back.key, 'u1|any');
       expect(back.deviation('alpha', 'Pz'), 3);
       expect(back.eyesClosed['alpha']!['Pz'], 30);
-      expect(back.indexMeans['frontalActivation'], 0.4);
+      expect(back.indexMeans['frontalActivation'], -0.4);
+      expect(back.schemaVersion, EegCalibration.currentSchema);
       expect(back.frames, 700);
       // Reactivity prefers posterior electrodes: Pz 30/12.
       expect(back.alphaReactivity, closeTo(2.5, 1e-9));
@@ -183,7 +217,6 @@ void main() {
       );
       expect(cal.baseline('alpha', 't7'), 8);
       expect(cal.meanBaseline('beta'), 4);
-      expect(cal.meanDeviation('beta'), 5); // quadrature: sqrt(9 + 16)
       expect(cal.covers(['t7']), isTrue);
       expect(cal.covers(['T7', 'T8']), isFalse);
     });

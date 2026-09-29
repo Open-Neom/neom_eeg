@@ -1,3 +1,42 @@
+## 0.4.0
+
+Correcciones de la revisión del 2026-09-22.
+
+- **Coherencia real.** `EegSpectral` (Hann + detrend, bandas únicas en
+  `EegBands`) con coherencia de Welch (MSC e imaginaria de Nolte) y umbral de
+  azar al 95 % por banda; `EegCoherenceTracker` en el hub (`analysisPair`,
+  `coherenceStream`, `lastCoherence`). "Coherencia" ya sólo significa eso;
+  `1 − |asimetría|` se llama **simetría** en índices, captura, widgets y
+  reglas. `EegNeuroStateAdapter` usa alfa y el mismo par (sin banda
+  dominante ni "acuerdo entre canales") y expone `coherenceKind`; al
+  desconectar emite un estado neutral.
+- **Vigilante.** Media móvil exponencial (`smoothing`) + `hysteresis` por
+  regla: una asimetría real de 0.33 con ruido de frames ya dispara (antes
+  0 avisos en 120 s). Cada regla usa su banda (antes la asimetría ignoraba
+  `rule.band`); las métricas de par se reinician si cambia el par y el aviso
+  lleva el par. Métrica nueva `symmetry`; `coherence` es espectral.
+  `alpha_entrained` → `alpha_over_rest` (cerrar los ojos la produce).
+- **Calibración.** Rechazo de artefactos (mediana/MAD), estadística en
+  log₁₀, `headZ` en σ reales de la cantidad de toda la cabeza y sólo sobre
+  los electrodos compartidos, `settle` de 3 s por fase, activación frontal
+  en log (media geométrica). `schemaVersion` 2; las anteriores cargan con
+  `supportsZ` falso. Eliminados `zScore(banda, valor)` y `meanDeviation`.
+- **Respuesta al estímulo.** La captura mide cada segundo el SNR en la
+  frecuencia del pulso isocrónico o del beat binaural (8 s de raw):
+  `ffrSnr/ffrHz`, `EegSessionCapture.frequencyFollowing`. `entrainmentIndex`
+  → `bandShift` (cambio espectral, no entrainment). Marcador rápido **Ojos
+  cerrados**.
+- **Capturas `schema: 2`** con `symmetry`; las del esquema 1 migran su
+  columna "coherence" a `symmetry`.
+- **MN8 = T7/T8** (según `unity-plugin/Src/Types.cs` de Emotiv; antes
+  AF7/AF8 y sin cobertura temporal). Nuevo `EegDeviceType.emotivMw20`;
+  `INSIGHT2-…` resuelve a Insight. TP9/TP10 son temporoparietales y cuentan
+  como cobertura temporal; `hasTemporalCoverage` sale del catálogo de pares.
+- `extractBandPower(..., sampleRate:)`: el deriver pasa la tasa real; la
+  estimación por timestamps corrige el error n/(n−1).
+- Ids de `EegSessionRecorder` en µs y monótonos (dos grabaciones en el mismo
+  milisegundo compartían id).
+
 ## 0.3.0 - 2026-09-22
 
 - `EegCalibration` ampliada (desviaciones, ojos cerrados, reactividad alfa,

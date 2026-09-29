@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:neom_core/domain/model/neom/neom_neuro_state.dart';
@@ -8,7 +9,13 @@ import 'package:neom_eeg/domain/models/eeg_device_info.dart';
 import 'package:neom_eeg/domain/models/eeg_mental_state.dart';
 import 'package:neom_eeg/domain/models/eeg_sample.dart';
 import 'package:neom_eeg/domain/use_cases/eeg_device_service.dart';
+import 'package:neom_eeg/data/hub/eeg_driver_registry.dart';
+import 'package:neom_eeg/data/hub/eeg_hub.dart';
 import 'package:neom_eeg/data/implementations/eeg_neuro_state_adapter.dart';
+import 'package:neom_eeg/domain/enums/eeg_device_type.dart';
+import 'package:neom_eeg/domain/enums/eeg_vendor.dart';
+
+import 'support/fake_eeg_driver.dart';
 
 /// Feeds band powers by hand so each state can be provoked deterministically.
 class _FakeDevice implements EegDeviceService {
@@ -141,6 +148,55 @@ void main() {
       device.emit([reading('AF3', 'alpha')]);
 
       expect((await next).coherence, 0.0);
+      expect(adapter.coherenceKind, EegCoherenceKind.none);
+    });
+
+    test('without raw EEG the value is alpha power symmetry, and says so', () async {
+      await adapter.start();
+      final next = adapter.stateStream.first;
+      device.emit([reading('AF3', 'alpha'), reading('AF4', 'alpha')]);
+      expect((await next).coherence, closeTo(1.0, 1e-9));
+      expect(adapter.coherenceKind, EegCoherenceKind.symmetry);
+    });
+
+    test('with a hub delivering raw EEG it is spectral coherence', () async {
+      final driver = FakeEegDriver(vendor: EegVendor.emotiv);
+      final hub = EegHub(registry: EegDriverRegistry([driver]));
+      await hub.connect(FakeEegDriver.device(EegDeviceType.emotivInsight));
+      final onHub = EegNeuroStateAdapter(deviceService: hub);
+      await onHub.start();
+
+      // Independent noise on T7 and T8: power balanced, oscillations not.
+      final rnd = Random(8);
+      double g() => sqrt(-2 * log(1 - rnd.nextDouble())) * cos(2 * pi * rnd.nextDouble());
+      for (var i = 0; i < 4 * 128; i++) {
+        driver.raw(EegSample(
+          timestamp: DateTime.now(),
+          channels: {for (final ch in ['AF3', 'T7', 'Pz', 'T8', 'AF4']) ch: 4200 + 5 * g()},
+          quality: const {},
+        ));
+      }
+      await Future<void>.delayed(Duration.zero);
+      expect(hub.lastCoherence, isNotNull);
+
+      final next = onHub.stateStream.first;
+      driver.bandPower([
+        for (final ch in ['AF3', 'T7', 'Pz', 'T8', 'AF4']) reading(ch, 'alpha'),
+      ]);
+      final snap = await next;
+      expect(onHub.coherenceKind, EegCoherenceKind.spectral);
+      // Symmetry would say 1.0; the signals do not oscillate together.
+      expect(snap.coherence, lessThan(0.5));
+      expect(snap.coherence, closeTo(hub.lastCoherence!.of('alpha')!, 1e-9));
+
+      // Unplugging the headset is announced, not left as a frozen reading.
+      final after = onHub.stateStream.first;
+      await hub.disconnect();
+      expect((await after).state, NeomNeuroState.neutral);
+      expect(onHub.isActive, isFalse);
+
+      await onHub.dispose();
+      await hub.dispose();
     });
   });
 

@@ -45,8 +45,8 @@ void main() {
   });
 
   group('EegDeviceType enum', () {
-    test('tiene 12 modelos soportados', () {
-      expect(EegDeviceType.values.length, 12);
+    test('tiene 13 modelos soportados', () {
+      expect(EegDeviceType.values.length, 13);
     });
 
     test('cada modelo pertenece a un vendor y cada vendor tiene modelos', () {
@@ -69,6 +69,8 @@ void main() {
       expect(EegDeviceType.fromCortexId('EPOCFLEX-1234'),
           EegDeviceType.emotivEpocFlex);
       expect(EegDeviceType.fromCortexId('MN8-0001'), EegDeviceType.emotivMn8);
+      expect(EegDeviceType.fromCortexId('MW20-0A1B'), EegDeviceType.emotivMw20);
+      expect(EegDeviceType.fromCortexId('INSIGHT2-A1B2'), EegDeviceType.emotivInsight);
       expect(EegDeviceType.fromCortexId('EPOC'), EegDeviceType.emotivEpocX);
       expect(EegDeviceType.fromCortexId('Muse-1234'), isNull);
     });

@@ -110,6 +110,8 @@ export 'data/providers/simulated_eeg_provider.dart';
 // ═══════════════════════════════════════════════════════════════
 export 'data/implementations/eeg_connection_controller.dart';
 export 'data/implementations/eeg_signal_processor.dart';
+export 'data/implementations/eeg_spectral.dart';
+export 'data/implementations/eeg_coherence_tracker.dart';
 export 'data/implementations/eeg_band_power_deriver.dart';
 export 'data/implementations/eeg_metrics_estimator.dart';
 export 'data/implementations/eeg_biofeedback_adapter.dart';

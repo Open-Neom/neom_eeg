@@ -7,6 +7,7 @@ import '../../domain/enums/eeg_device_type.dart';
 import '../../domain/enums/eeg_vendor.dart';
 import '../../domain/models/eeg_band_power.dart';
 import '../../domain/models/eeg_capabilities.dart';
+import '../../domain/models/eeg_channel_catalog.dart';
 import '../../domain/models/eeg_device_info.dart';
 import '../../domain/models/eeg_device_status.dart';
 import '../../domain/models/eeg_exceptions.dart';
@@ -18,6 +19,7 @@ import '../../domain/use_cases/eeg_driver.dart';
 import '../../domain/use_cases/eeg_processor_service.dart';
 import '../../domain/use_cases/eeg_recording_service.dart';
 import '../implementations/eeg_band_power_deriver.dart';
+import '../implementations/eeg_coherence_tracker.dart';
 import '../implementations/eeg_metrics_estimator.dart';
 import '../implementations/eeg_signal_processor.dart';
 import '../implementations/local_eeg_recording_service.dart';
@@ -75,7 +77,10 @@ class EegScanReport {
 ///   never names Emotiv, Muse or OpenBCI;
 /// * the three data streams are always populated: when a driver lacks
 ///   native band powers or metrics ([EegCapabilities]), the hub derives
-///   them with [EegBandPowerDeriver] / [EegMetricsEstimator].
+///   them with [EegBandPowerDeriver] / [EegMetricsEstimator];
+/// * from the raw stream it estimates spectral coherence between the two
+///   electrodes of the [analysisPair] ([coherenceStream]) — the one
+///   hemispheric coherence every consumer reads.
 ///
 /// ```dart
 /// final hub = EegHub.standard(emotiv: EmotivCortexConfig.fromAppProperties());
@@ -97,6 +102,9 @@ class EegHub implements EegDeviceService {
   final double minContactQuality;
   final EegBandPowerDeriver _deriver;
   final EegMetricsEstimator _estimator;
+  final EegCoherenceTracker _coherence;
+  EegHemisphericPair? _analysisPair;
+  EegPairCoherence? _lastCoherence;
 
   EegDriver? _active;
   EegConnectionState _ownState = EegConnectionState.disconnected;
@@ -111,6 +119,7 @@ class EegHub implements EegDeviceService {
   final _mental = StreamController<EegMentalState>.broadcast();
   final _status = StreamController<EegDeviceStatus>.broadcast();
   final _connection = StreamController<EegConnectionState>.broadcast();
+  final _coherenceCtl = StreamController<EegPairCoherence>.broadcast();
 
   EegHub({
     required this.registry,
@@ -120,7 +129,9 @@ class EegHub implements EegDeviceService {
     Duration derivedWindow = const Duration(seconds: 1),
     Duration derivedHop = const Duration(milliseconds: 250),
     EegMetricsEstimator? estimator,
+    EegCoherenceTracker? coherenceTracker,
   })  : processor = processor ?? EegSignalProcessor(),
+        _coherence = coherenceTracker ?? EegCoherenceTracker(),
         _deriver = EegBandPowerDeriver(
           processor: processor ?? EegSignalProcessor(),
           window: derivedWindow,
@@ -198,6 +209,20 @@ class EegHub implements EegDeviceService {
   /// Electrodes currently dropped from band-power frames because their
   /// contact quality is below [minContactQuality].
   List<String> get excludedChannels => _excluded.toList();
+
+  /// Left/right pair hemispheric metrics are computed on: the best pair of
+  /// the connected layout among the electrodes in contact (T7/T8 on an
+  /// Insight; AF3/AF4 if T7 or T8 has no contact). Null without a pair.
+  EegHemisphericPair? get analysisPair => _analysisPair;
+
+  /// Spectral coherence of [analysisPair] from the raw stream, about once a
+  /// second. Silent for drivers that deliver no raw EEG (Emotiv without a
+  /// raw-data license).
+  Stream<EegPairCoherence> get coherenceStream => _coherenceCtl.stream;
+
+  /// Latest coherence reading; null until the first window fills, after a
+  /// pair change, and while disconnected.
+  EegPairCoherence? get lastCoherence => _lastCoherence;
 
   /// Recording and markers for whatever is connected: the driver's own
   /// service when it has one (Emotiv → Cortex records, visible in
@@ -368,6 +393,7 @@ class EegHub implements EegDeviceService {
       _mental.close(),
       _status.close(),
       _connection.close(),
+      _coherenceCtl.close(),
     ]);
   }
 
@@ -384,10 +410,22 @@ class EegHub implements EegDeviceService {
 
     _deriver.reset();
     _estimator.reset();
+    _coherence.reset();
     _excluded = const {};
+    _lastCoherence = null;
+    _updateAnalysisPair(driver.connectedDevice ?? device);
 
     _forwarders.add(driver.rawStream.listen((sample) {
       _raw.add(sample);
+      final pair = _analysisPair;
+      if (pair != null) {
+        final rate = driver.connectedDevice?.sampleRate ?? device.sampleRate;
+        final c = _coherence.push(sample, pair, rate);
+        if (c != null) {
+          _lastCoherence = c;
+          if (!_disposed) _coherenceCtl.add(c);
+        }
+      }
       if (!deriveBandPower) return;
       final channels = driver.connectedDevice?.channels ?? device.channels;
       final rate = driver.connectedDevice?.sampleRate ?? device.sampleRate;
@@ -406,9 +444,12 @@ class EegHub implements EegDeviceService {
     }
 
     _forwarders.add(driver.statusStream.listen((status) {
-      _excluded = minContactQuality <= 0
-          ? const {}
+      final excluded = minContactQuality <= 0
+          ? const <String>{}
           : status.poorContacts(threshold: minContactQuality).toSet();
+      final changed = excluded.length != _excluded.length || !excluded.containsAll(_excluded);
+      _excluded = excluded;
+      if (changed) _updateAnalysisPair(driver.connectedDevice ?? device);
       _status.add(status);
     }));
     _forwarders.add(driver.connectionStateStream.listen((state) {
@@ -445,6 +486,20 @@ class EegHub implements EegDeviceService {
       s.cancel();
     }
     _forwarders.clear();
+    _coherence.reset();
+    _analysisPair = null;
+    _lastCoherence = null;
+  }
+
+  void _updateAnalysisPair(EegDeviceInfo device) {
+    final labels = device.channels.map((c) => c.name).where((l) => !_excluded.contains(l));
+    final next = EegChannelCatalog.bestPair(labels);
+    if (next != _analysisPair) {
+      _analysisPair = next;
+      // A reading from the previous pair would be mislabelled.
+      _lastCoherence = null;
+      _coherence.reset();
+    }
   }
 
   void _setOwnState(EegConnectionState state) {
