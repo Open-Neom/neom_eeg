@@ -77,9 +77,25 @@ class EmotivCortexConfig {
     );
   }
 
-  Uri get serviceUri => Uri(scheme: 'wss', host: host, port: port);
+  static final RegExp _controlOrBidiChars = RegExp(
+    r'[\x00-\x1F\x7F-\x9F\u0085\u061C\u200B-\u200F\u2028-\u202E\u2060\u2066-\u2069\uFEFF]',
+  );
 
-  bool get isConfigured => clientId.isNotEmpty && clientSecret.isNotEmpty;
+  Uri get serviceUri {
+    final cleanHost = host.trim();
+    final safePort = (port >= 1 && port <= 65535) ? port : 6868;
+    return Uri(
+      scheme: 'wss',
+      host: cleanHost.isEmpty ? 'localhost' : cleanHost,
+      port: safePort,
+    );
+  }
+
+  bool get isConfigured =>
+      clientId.trim().isNotEmpty &&
+      clientSecret.trim().isNotEmpty &&
+      !_controlOrBidiChars.hasMatch(clientId) &&
+      !_controlOrBidiChars.hasMatch(clientSecret);
 
   EmotivCortexConfig copyWith({
     String? clientId,

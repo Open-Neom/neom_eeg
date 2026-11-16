@@ -216,7 +216,7 @@ class _EegCalibrationSheetState extends State<EegCalibrationSheet> {
                     icon: const Icon(Icons.close, color: Colors.white54),
                     onPressed: () {
                       if (running) c.cancel();
-                      Navigator.of(context).pop();
+                      Sint.pop();
                     },
                   ),
                 ],
@@ -290,7 +290,7 @@ class _EegCalibrationSheetState extends State<EegCalibrationSheet> {
                       Expanded(
                         child: FilledButton(
                           key: const ValueKey('eeg-calibration-done'),
-                          onPressed: () => Navigator.of(context).pop(),
+                          onPressed: () => Sint.pop(),
                           child: const Text('Listo'),
                         ),
                       ),

@@ -135,13 +135,23 @@ class EegSpectral {
 
   static final _hannCache = <int, List<double>>{};
   static final _twiddleCache = <String, ({List<double> cos, List<double> sin})>{};
+  static const int _maxCacheEntries = 64;
 
-  static List<double> hann(int n) => _hannCache.putIfAbsent(
-        n,
-        () => n <= 1
-            ? List.filled(n, 1.0)
-            : [for (var i = 0; i < n; i++) 0.5 - 0.5 * math.cos(2 * math.pi * i / (n - 1))],
-      );
+  static List<double> hann(int n) {
+    if (n <= 0) return const [];
+    if (!_hannCache.containsKey(n) && _hannCache.length >= _maxCacheEntries) {
+      _hannCache.clear();
+    }
+    return _hannCache.putIfAbsent(
+      n,
+      () => n <= 1
+          ? List.filled(n, 1.0)
+          : [
+              for (var i = 0; i < n; i++)
+                0.5 - 0.5 * math.cos(2 * math.pi * i / (n - 1)),
+            ],
+    );
+  }
 
   /// Removes the least-squares line, so electrode drift and the DC offset
   /// of consumer headsets (≈4200 µV on Emotiv) do not leak into delta.
@@ -170,22 +180,32 @@ class EegSpectral {
     return [for (var i = 0; i < d.length; i++) d[i] * w[i]];
   }
 
-  static int _maxBin(int n, double fs, double maxHz) =>
-      math.min(n ~/ 2, (maxHz * n / fs).floor());
+  static int _maxBin(int n, double fs, double maxHz) {
+    if (!fs.isFinite || fs <= 0 || !maxHz.isFinite || maxHz <= 0 || n <= 0) {
+      return 0;
+    }
+    return math.min(n ~/ 2, (maxHz * n / fs).floor());
+  }
 
-  static ({List<double> cos, List<double> sin}) _twiddles(int n, int bins) =>
-      _twiddleCache.putIfAbsent('$n:$bins', () {
-        final c = List<double>.filled(bins * n, 0);
-        final s = List<double>.filled(bins * n, 0);
-        for (var k = 1; k <= bins; k++) {
-          for (var i = 0; i < n; i++) {
-            final a = -2.0 * math.pi * k * i / n;
-            c[(k - 1) * n + i] = math.cos(a);
-            s[(k - 1) * n + i] = math.sin(a);
-          }
+  static ({List<double> cos, List<double> sin}) _twiddles(int n, int bins) {
+    final key = '$n:$bins';
+    if (!_twiddleCache.containsKey(key) &&
+        _twiddleCache.length >= _maxCacheEntries) {
+      _twiddleCache.clear();
+    }
+    return _twiddleCache.putIfAbsent(key, () {
+      final c = List<double>.filled(bins * n, 0);
+      final s = List<double>.filled(bins * n, 0);
+      for (var k = 1; k <= bins; k++) {
+        for (var i = 0; i < n; i++) {
+          final a = -2.0 * math.pi * k * i / n;
+          c[(k - 1) * n + i] = math.cos(a);
+          s[(k - 1) * n + i] = math.sin(a);
         }
-        return (cos: c, sin: s);
-      });
+      }
+      return (cos: c, sin: s);
+    });
+  }
 
   /// Real/imaginary DFT of an already windowed segment, bins `1..bins`.
   static (List<double>, List<double>) _dft(List<double> x, int bins) {
@@ -213,11 +233,14 @@ class EegSpectral {
   /// sums are comparable with the previous unwindowed estimates.
   static EegSpectrum powerSpectrum(List<double> x, double fs, {double maxHz = 50}) {
     final n = x.length;
-    if (n < 4 || fs <= 0) return const EegSpectrum([], []);
+    if (n < 4 || !fs.isFinite || fs <= 0 || !maxHz.isFinite || maxHz <= 0) {
+      return const EegSpectrum([], []);
+    }
     final bins = _maxBin(n, fs, maxHz);
     if (bins < 1) return const EegSpectrum([], []);
     final w = hann(n);
     final norm = w.fold<double>(0.0, (a, v) => a + v * v) * n;
+    if (norm <= 0) return const EegSpectrum([], []);
     final (re, im) = _dft(_prepare(x), bins);
     return EegSpectrum(
       [for (var k = 1; k <= bins; k++) k * fs / n],
@@ -236,6 +259,17 @@ class EegSpectral {
     double overlap = 0.5,
     double maxHz = 45,
   }) {
+    if (!fs.isFinite ||
+        fs <= 0 ||
+        !segmentSeconds.isFinite ||
+        segmentSeconds <= 0 ||
+        !overlap.isFinite ||
+        overlap < 0 ||
+        overlap >= 1.0 ||
+        !maxHz.isFinite ||
+        maxHz <= 0) {
+      return EegCoherenceSpectrum.empty;
+    }
     final n = math.min(x.length, y.length);
     final seg = (segmentSeconds * fs).round();
     if (seg < 8 || n < seg) return EegCoherenceSpectrum.empty;
@@ -286,6 +320,14 @@ class EegSpectral {
   /// Windowed power of [x] at exactly [f] Hz (single-frequency DFT, not
   /// bin-aligned). Same normalisation as [powerSpectrum].
   static double powerAt(List<double> prepared, double fs, double f, double norm) {
+    if (prepared.isEmpty ||
+        !fs.isFinite ||
+        fs <= 0 ||
+        !f.isFinite ||
+        !norm.isFinite ||
+        norm <= 0) {
+      return 0.0;
+    }
     var r = 0.0, j = 0.0;
     final w = -2.0 * math.pi * f / fs;
     for (var i = 0; i < prepared.length; i++) {
@@ -313,7 +355,18 @@ class EegSpectral {
     double neighbour = 1.5,
   }) {
     final n = x.length;
-    if (n < 8 || fs <= 0 || f0 <= 0 || f0 + neighbour >= fs / 2) return null;
+    if (n < 8 ||
+        !fs.isFinite ||
+        fs <= 0 ||
+        !f0.isFinite ||
+        f0 <= 0 ||
+        !exclude.isFinite ||
+        exclude <= 0 ||
+        !neighbour.isFinite ||
+        neighbour <= exclude ||
+        f0 + neighbour >= fs / 2) {
+      return null;
+    }
     final resolution = fs / n;
     if (resolution > exclude) return null;
     final prepared = _prepare(x);

@@ -34,15 +34,44 @@ class CortexStreamParser {
     'TIMESTAMP',
   };
 
+  static const double _maxSafeEpochSeconds = 8640000000000.0;
+  static const Set<String> _forbiddenLabels = <String>{
+    '__proto__',
+    'constructor',
+    'prototype',
+  };
+  static final RegExp _unsafeLabelChars = RegExp(
+    r'[\x00-\x1F\x7F-\x9F\u0085\u061C\u200B-\u200F\u2028-\u202E\u2060\u2066-\u2069\uFEFF]',
+  );
+
+  static bool _isSafeLabel(String raw) {
+    if (raw.isEmpty || raw.length > 64 || raw.trim() != raw) return false;
+    if (_unsafeLabelChars.hasMatch(raw)) return false;
+    final lower = raw.toLowerCase();
+    if (_forbiddenLabels.contains(lower) ||
+        (raw.startsWith('__') && raw.endsWith('__'))) {
+      return false;
+    }
+    return true;
+  }
+
   /// Cortex `time` is seconds since the Unix epoch (with fraction).
-  static DateTime timestamp(num? seconds) => seconds == null
-      ? DateTime.now()
-      : DateTime.fromMicrosecondsSinceEpoch((seconds * 1e6).round());
+  static DateTime timestamp(num? seconds) {
+    if (seconds == null) return DateTime.now();
+    final sec = seconds.toDouble();
+    if (!sec.isFinite || sec < 0 || sec > _maxSafeEpochSeconds) {
+      return DateTime.now();
+    }
+    return DateTime.fromMicrosecondsSinceEpoch((sec * 1e6).round());
+  }
 
   /// Electrode labels in the order the `eeg` stream carries them.
   static List<String> sensorLabels(List<dynamic> eegCols) => [
         for (final c in eegCols)
-          if (c is String && !reservedEegColumns.contains(c.toUpperCase())) c,
+          if (c is String &&
+              _isSafeLabel(c) &&
+              !reservedEegColumns.contains(c.toUpperCase()))
+            c,
       ];
 
   static EegSample? parseEeg({
@@ -55,11 +84,16 @@ class CortexStreamParser {
     final n = cols.length < values.length ? cols.length : values.length;
     for (var i = 0; i < n; i++) {
       final col = cols[i];
-      if (col is! String || reservedEegColumns.contains(col.toUpperCase())) {
+      if (col is! String ||
+          !_isSafeLabel(col) ||
+          reservedEegColumns.contains(col.toUpperCase())) {
         continue;
       }
       final v = values[i];
-      if (v is num) channels[col] = v.toDouble();
+      if (v is num) {
+        final dv = v.toDouble();
+        if (dv.isFinite) channels[col] = dv;
+      }
     }
     if (channels.isEmpty) return null;
 
@@ -68,7 +102,8 @@ class CortexStreamParser {
       channels: channels,
       quality: {
         for (final ch in channels.keys)
-          if (quality.containsKey(ch)) ch: quality[ch]!,
+          if (quality.containsKey(ch) && quality[ch]!.isFinite)
+            ch: quality[ch]!,
       },
     );
   }
@@ -89,12 +124,15 @@ class CortexStreamParser {
       final col = cols[i];
       final v = values[i];
       if (col is! String || v is! num) continue;
+      final dv = v.toDouble();
+      if (!dv.isFinite) continue;
       final slash = col.indexOf('/');
       if (slash <= 0) continue;
       final sensor = col.substring(0, slash);
       final band = col.substring(slash + 1).toLowerCase();
+      if (!_isSafeLabel(sensor) || !_isSafeLabel(band)) continue;
       if (!perSensor.containsKey(sensor)) order.add(sensor);
-      perSensor.putIfAbsent(sensor, () => {})[band] = v.toDouble();
+      perSensor.putIfAbsent(sensor, () => {})[band] = dv;
     }
 
     final ts = timestamp(time);
@@ -128,24 +166,32 @@ class CortexStreamParser {
       if (col is! String || col.endsWith('.isActive')) continue;
       final v = values[i];
       if (v is! num) continue; // null while the detection warms up
-      any = true;
+      final dv = v.toDouble();
+      if (!dv.isFinite) continue;
       switch (col) {
         case 'eng':
-          metrics['engagement'] = v.toDouble();
+          any = true;
+          metrics['engagement'] = dv;
         case 'exc':
-          metrics['excitement'] = v.toDouble();
+          any = true;
+          metrics['excitement'] = dv;
         case 'str':
         case 'cognitiveStress':
-          metrics['stress'] = v.toDouble();
+          any = true;
+          metrics['stress'] = dv;
         case 'rel':
-          metrics['relaxation'] = v.toDouble();
+          any = true;
+          metrics['relaxation'] = dv;
         case 'foc':
         case 'attention':
-          metrics['focus'] = v.toDouble();
+          any = true;
+          metrics['focus'] = dv;
         case 'int':
-          metrics['interest'] = v.toDouble();
+          any = true;
+          metrics['interest'] = dv;
         case 'lex':
-          metrics['longTermExcitement'] = v.toDouble();
+          any = true;
+          metrics['longTermExcitement'] = dv;
       }
     }
     if (!any) return null;
@@ -180,20 +226,24 @@ class CortexStreamParser {
           final label = col[j];
           final q = v[j];
           if (label is! String || q is! num) continue;
+          final dq = q.toDouble();
+          if (!dq.isFinite || !_isSafeLabel(label)) continue;
           if (label.toUpperCase() == 'OVERALL') {
-            overall = (q / 100.0).clamp(0.0, 1.0);
+            overall = (dq / 100.0).clamp(0.0, 1.0);
           } else {
-            contact[label] = (q / 4.0).clamp(0.0, 1.0);
+            contact[label] = (dq / 4.0).clamp(0.0, 1.0);
           }
         }
       } else if (col is String && v is num) {
+        final dv = v.toDouble();
+        if (!dv.isFinite) continue;
         switch (col) {
           case 'BatteryPercent':
-            battery = (v / 100.0).clamp(0.0, 1.0);
+            battery = (dv / 100.0).clamp(0.0, 1.0);
           case 'Battery':
-            battery ??= (v / 4.0).clamp(0.0, 1.0);
+            battery ??= (dv / 4.0).clamp(0.0, 1.0);
           case 'Signal':
-            signal = v.toDouble().clamp(0.0, 1.0);
+            signal = dv.clamp(0.0, 1.0);
         }
       }
     }
@@ -224,15 +274,19 @@ class CortexStreamParser {
       final col = cols[i];
       final v = values[i];
       if (col is! String || v is! num) continue;
+      final dv = v.toDouble();
+      if (!dv.isFinite) continue;
       switch (col) {
         case 'batteryPercent':
-          battery = (v / 100.0).clamp(0.0, 1.0);
+          battery = (dv / 100.0).clamp(0.0, 1.0);
         case 'overall':
-          overall = (v / 100.0).clamp(0.0, 1.0);
+          overall = (dv / 100.0).clamp(0.0, 1.0);
         case 'sampleRateQuality':
           break; // -1 flags data loss; not a per-electrode value
         default:
-          contact[col] = (v / 4.0).clamp(0.0, 1.0);
+          if (_isSafeLabel(col)) {
+            contact[col] = (dv / 4.0).clamp(0.0, 1.0);
+          }
       }
     }
 

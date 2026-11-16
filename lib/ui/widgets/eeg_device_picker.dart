@@ -149,7 +149,6 @@ class _EegDevicePickerState extends State<EegDevicePicker> {
   ) async {
     // The progress dialog must not be awaited: with barrierDismissible false
     // it only closes when we pop it after the connection settles.
-    final navigator = Navigator.of(context, rootNavigator: true);
     var dialogOpen = true;
     unawaited(showDialog<void>(
       context: context,
@@ -190,7 +189,7 @@ class _EegDevicePickerState extends State<EegDevicePicker> {
 
     await controller.connectDevice(device);
 
-    if (dialogOpen && navigator.mounted) navigator.pop();
+    if (dialogOpen) Sint.pop();
     if (!mounted) return;
 
     if (controller.state.value == EegConnectionState.streaming) {

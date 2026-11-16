@@ -29,6 +29,7 @@ class LocalEegRecordingService implements EegRecordingService {
   final _activeChanges = StreamController<EegRecording?>.broadcast();
   EegRecording? _active;
   int _markerSeq = 0;
+  bool _disposed = false;
 
   LocalEegRecordingService({
     required this.source,
@@ -54,6 +55,31 @@ class LocalEegRecordingService implements EegRecordingService {
   @override
   bool get canExportToFolder => false;
 
+  static final RegExp _pairedInternalBlockRe = RegExp(
+    r'(?:<\s*(?:think(?:ing)?|thought|memory_recall|auto_memory|system_context)\b[^>]*>[\s\S]*?<\s*/\s*(?:think(?:ing)?|thought|memory_recall|auto_memory|system_context)\s*>|\[\s*(BIOCHIP|MEMORY_RECALL|AUTO_MEMORY|SYSTEM_CONTEXT)\s*\](?:(?!\[\s*\1\s*\])[\s\S])*?\[\s*/\s*\1\s*\])',
+    caseSensitive: false,
+  );
+  static final RegExp _standaloneInternalTagRe = RegExp(
+    r'(?:\[\s*/?\s*(?:BIOCHIP(?:\s*:[^\]]*)?|MEMORY_RECALL(?:\s*:[^\]]*)?|AUTO_MEMORY(?:\s*:[^\]]*)?|SYSTEM_CONTEXT(?:\s*:[^\]]*)?)\s*\]|<\s*/?\s*(?:think(?:ing)?|thought|memory_recall|auto_memory|system_context)\b[^>]*>)',
+    caseSensitive: false,
+  );
+  static final RegExp _controlOrBidiRe = RegExp(
+    r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\u0085\u061C\u200B\u200C\u200E\u200F\u2028-\u202E\u2060-\u2064\u2066-\u2069\uFEFF]',
+  );
+
+  static String _cleanField(String raw, {int maxChars = 512}) {
+    final stripped = raw
+        .replaceAll(_pairedInternalBlockRe, '')
+        .replaceAll(_standaloneInternalTagRe, '')
+        .replaceAll(_controlOrBidiRe, '')
+        .trim();
+    if (stripped.length <= maxChars) return stripped;
+    var end = maxChars;
+    final cu = stripped.codeUnitAt(end - 1);
+    if (cu >= 0xD800 && cu <= 0xDBFF) end--;
+    return stripped.substring(0, end);
+  }
+
   @override
   Future<EegRecording> startRecording({
     required String title,
@@ -63,28 +89,41 @@ class LocalEegRecordingService implements EegRecordingService {
   }) async {
     if (_active != null) await stopRecording();
 
+    final cleanTitle = _cleanField(title, maxChars: 256);
+    final cleanDesc =
+        description == null ? null : _cleanField(description, maxChars: 2048);
+    final cleanSubject =
+        subject == null ? null : _cleanField(subject, maxChars: 256);
+    final cleanTags = tags
+        .take(64)
+        .map((t) => _cleanField(t, maxChars: 64))
+        .where((t) => t.isNotEmpty)
+        .toList(growable: false);
+
     final session = await recorder.startSession(
       deviceType: source.connectedDevice?.type ?? deviceTypeOf(),
       deviceService: source,
     );
     recorder.addEvent('recordingStarted', data: {
-      'title': title,
-      'description': ?description,
-      'subject': ?subject,
-      if (tags.isNotEmpty) 'tags': tags,
+      'title': cleanTitle,
+      'description': ?cleanDesc,
+      'subject': ?cleanSubject,
+      if (cleanTags.isNotEmpty) 'tags': cleanTags,
     });
     _markerSeq = 0;
     _active = EegRecording(
       id: session.id,
-      title: title,
-      description: description,
-      subject: subject,
-      tags: tags,
+      title: cleanTitle,
+      description: cleanDesc,
+      subject: cleanSubject,
+      tags: cleanTags,
       startedAt: session.startTime,
       backend: EegRecordingBackend.local,
       sampleRate: source.connectedDevice?.sampleRate,
     );
-    _activeChanges.add(_active);
+    if (!_activeChanges.isClosed) {
+      _activeChanges.add(_active);
+    }
     return _active!;
   }
 
@@ -94,7 +133,9 @@ class LocalEegRecordingService implements EegRecordingService {
     if (active == null) return null;
     final session = await recorder.stopSession();
     _active = null;
-    _activeChanges.add(null);
+    if (!_activeChanges.isClosed) {
+      _activeChanges.add(null);
+    }
     return active.copyWith(
       endedAt: session?.endTime ?? DateTime.now(),
       metadata: {'sampleCount': session?.sampleCount ?? 0},
@@ -115,33 +156,41 @@ class LocalEegRecordingService implements EegRecordingService {
         'Inicia una grabación antes de marcar un evento',
       );
     }
+    final cleanLabel = _cleanField(label, maxChars: 256);
+    final cleanPort = _cleanField(port, maxChars: 128);
     final marker = EegMarker(
       id: '${active.id}-m${++_markerSeq}',
-      label: label,
+      label: cleanLabel,
       value: value,
       at: at ?? DateTime.now(),
-      port: port,
+      port: cleanPort,
       extras: extras,
       recordingId: active.id,
     );
     recorder.addEvent('marker', data: {
       'markerId': marker.id,
-      'label': label,
+      'label': cleanLabel,
       'value': value,
       'at': marker.at.toIso8601String(),
-      'port': port,
+      'port': cleanPort,
       if (extras.isNotEmpty) 'extras': extras,
     });
     _active = active.copyWith(markerCount: active.markerCount + 1);
-    _markers.add(marker);
+    if (!_markers.isClosed) {
+      _markers.add(marker);
+    }
     return marker;
   }
 
   @override
   Future<List<EegRecording>> listRecordings({int limit = 50}) async {
+    if (!limit.toDouble().isFinite || limit <= 0) {
+      return const <EegRecording>[];
+    }
+    final safeLimit = limit > 500 ? 500 : limit;
     final sessions = await recorder.getSessions();
     return [
-      for (final s in sessions.take(limit)) _fromSession(s),
+      for (final s in sessions.take(safeLimit)) _fromSession(s),
     ];
   }
 
@@ -185,6 +234,8 @@ class LocalEegRecordingService implements EegRecordingService {
   }
 
   Future<void> dispose() async {
+    if (_disposed) return;
+    _disposed = true;
     await stopRecording();
     await _markers.close();
     await _activeChanges.close();

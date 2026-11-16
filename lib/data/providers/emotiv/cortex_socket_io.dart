@@ -23,12 +23,17 @@ WebSocketChannel connectCortexSocket(Uri uri) {
   }
   final client = HttpClient(context: context)
     ..badCertificateCallback = (X509Certificate cert, String host, int port) =>
-        _isLoopback(host) && port == uri.port;
+        _isLoopback(uri.host) && _isLoopback(host) && port == uri.port;
   return IOWebSocketChannel.connect(uri, customClient: client);
 }
 
-bool _isLoopback(String host) =>
-    host == 'localhost' || host == '127.0.0.1' || host == '::1';
+bool _isLoopback(String host) {
+  final normalized = host.trim().toLowerCase();
+  return normalized == 'localhost' ||
+      normalized == '127.0.0.1' ||
+      normalized == '::1' ||
+      normalized == '[::1]';
+}
 
 /// EMOTIV Launcher (which hosts the Cortex service) only ships for
 /// Windows, macOS and Linux. On phones the embedded library is the path.

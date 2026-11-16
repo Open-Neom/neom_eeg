@@ -271,7 +271,9 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
     });
     final record = (result['record'] as Map?)?.cast<String, dynamic>() ?? result;
     _activeRecording = _recordingFrom(record, fallbackTitle: title);
-    _recordingChanges.add(_activeRecording);
+    if (!_recordingChanges.isClosed) {
+      _recordingChanges.add(_activeRecording);
+    }
     return _activeRecording!;
   }
 
@@ -285,7 +287,9 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
       'session': s.session,
     });
     _activeRecording = null;
-    _recordingChanges.add(null);
+    if (!_recordingChanges.isClosed) {
+      _recordingChanges.add(null);
+    }
     final record = (result['record'] as Map?)?.cast<String, dynamic>();
     return record == null
         ? active.copyWith(endedAt: DateTime.now())
@@ -308,8 +312,8 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
         'Cortex sólo acepta markers dentro de un record: inicia la grabación',
       );
     }
-    if (value is int && value < 0) {
-      throw const EegException('Cortex requiere valores de marker ≥ 0');
+    if ((value is int && value < 0) || (value is num && !value.isFinite)) {
+      throw const EegException('Cortex requiere valores de marker finitos y ≥ 0');
     }
     final when = at ?? DateTime.now();
     final result = await _client.call('injectMarker', {
@@ -333,12 +337,15 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
       recordingId: (result['recordId'] as String?) ?? active.id,
     );
     _activeRecording = active.copyWith(markerCount: active.markerCount + 1);
-    _markers.add(marker);
+    if (!_markers.isClosed) {
+      _markers.add(marker);
+    }
     return marker;
   }
 
   @override
   Future<List<EegRecording>> listRecordings({int limit = 50}) async {
+    final safeLimit = limit.clamp(1, 500);
     final token = _cortexToken ?? await _tokenForQueries();
     final result = await _client.call('queryRecords', {
       'cortexToken': token,
@@ -346,13 +353,40 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
       'orderBy': [
         {'startDatetime': 'DESC'},
       ],
-      'limit': limit,
+      'limit': safeLimit,
       'offset': 0,
     });
     return [
       for (final r in (result['records'] as List?) ?? const [])
         if (r is Map) _recordingFrom(r.cast<String, dynamic>()),
     ];
+  }
+
+  static final RegExp _controlOrBidiChars = RegExp(
+    r'[\x00-\x1F\x7F-\x9F\u0085\u061C\u200B-\u200F\u2028-\u202E\u2060\u2066-\u2069\uFEFF]',
+  );
+
+  static bool _isSafeExportFolder(String folder) {
+    if (folder.isEmpty || _controlOrBidiChars.hasMatch(folder)) return false;
+    final trimmed = folder.trim();
+    if (trimmed.isEmpty || trimmed.length > 1024) return false;
+    final lower = trimmed.toLowerCase();
+    if (trimmed.startsWith('//') ||
+        trimmed.startsWith(r'\\') ||
+        trimmed.startsWith(r'\??\') ||
+        lower.contains('%00') ||
+        lower.contains('%2e')) {
+      return false;
+    }
+    final segments = trimmed.split(RegExp(r'[/\\]'));
+    return !segments.contains('..') && !segments.contains('.');
+  }
+
+  static bool _isSafeRecordId(String id) {
+    final clean = id.trim();
+    return clean.isNotEmpty &&
+        clean.length <= 128 &&
+        !_controlOrBidiChars.hasMatch(id);
   }
 
   @override
@@ -366,23 +400,43 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
       EegExportStream.performanceMetrics,
     },
   }) async {
+    if (!_isSafeExportFolder(folder)) {
+      throw const EegException(
+        'Carpeta de exportación inválida: no se permiten rutas vacías ni segmentos ".."',
+      );
+    }
+    final cleanFolder = folder.trim();
+    final safeIds = [
+      for (final id in ids.take(200))
+        if (_isSafeRecordId(id)) id.trim(),
+    ];
     if (!canExportToFolder) {
       return EegExportResult(
         exported: const [],
         failed: {
-          for (final id in ids)
+          for (final id in ids.take(200))
             id: 'La Cortex Library móvil no exporta; usa EMOTIV Launcher o '
                 'EmotivPRO en escritorio',
         },
-        folder: folder,
+        folder: cleanFolder,
+        format: format,
+      );
+    }
+    if (safeIds.isEmpty) {
+      return EegExportResult(
+        exported: const [],
+        failed: {
+          for (final id in ids.take(200)) id: 'ID de grabación inválido',
+        },
+        folder: cleanFolder,
         format: format,
       );
     }
     final token = _cortexToken ?? await _tokenForQueries();
     final result = await _client.call('exportRecord', {
       'cortexToken': token,
-      'recordIds': ids,
-      'folder': folder,
+      'recordIds': safeIds,
+      'folder': cleanFolder,
       'format': format.cortexName,
       'streamTypes': [for (final s in streams) s.cortexName],
       'version': 'V2',
@@ -420,7 +474,8 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
   /// refreshed from it.
   Future<EegDeviceInfo> updateHeadsetSettings(CortexHeadsetSettings settings) async {
     final s = _requireSession();
-    final device = connectedDevice!;
+    final device = connectedDevice;
+    if (device == null) throw const EegException('Sin headset conectado');
     await _client.call('updateHeadset', {
       'cortexToken': s.token,
       'headset': device.id,
@@ -500,6 +555,7 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
     DateTime parse(dynamic v) =>
         v is String ? (DateTime.tryParse(v) ?? DateTime.now()) : DateTime.now();
     final markers = r['markers'];
+    final rawRate = r['samplingRate'];
     return EegRecording(
       id: (r['uuid'] ?? r['id'] ?? '').toString(),
       title: (r['title'] as String?) ?? fallbackTitle ?? '',
@@ -509,7 +565,7 @@ class EmotivCortexProvider extends EegDriverBase implements EegRecordingService 
       startedAt: parse(r['startDatetime'] ?? r['createdTime']),
       endedAt: r['endDatetime'] is String ? parse(r['endDatetime']) : null,
       backend: EegRecordingBackend.native,
-      sampleRate: (r['samplingRate'] as num?)?.toInt(),
+      sampleRate: (rawRate is num && rawRate.isFinite) ? rawRate.toInt() : null,
       markerCount: markers is List ? markers.length : 0,
       metadata: {
         for (final k in ['uuid', 'exportIds', 'fileType', 'licenseId', 'headsetId'])

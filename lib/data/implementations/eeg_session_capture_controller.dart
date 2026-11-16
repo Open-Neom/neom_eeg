@@ -122,6 +122,10 @@ class EegSessionCaptureController extends SintController {
   StreamSubscription<EegMarker>? _markerSub;
 
   Box<Map>? _box;
+  final Map<String, Map<String, dynamic>> _memoryFallback = {};
+  bool _disposed = false;
+  static const int _maxSegmentEvents = 10000;
+  static const int _maxRawChannels = 64;
 
   @override
   void onInit() {
@@ -139,13 +143,25 @@ class EegSessionCaptureController extends SintController {
 
   @override
   void onClose() {
+    if (_disposed) return;
+    _disposed = true;
     _ticker?.cancel();
+    _ticker = null;
     _contextTimer?.cancel();
+    _contextTimer = null;
     _markerSub?.cancel();
+    _markerSub = null;
     _recordingSub?.cancel();
+    _recordingSub = null;
     for (final s in _subs) {
       s.cancel();
     }
+    _subs.clear();
+    liveStats.close();
+    segmentOpen.close();
+    segmentPracticeId.close();
+    segmentSeconds.close();
+    captures.close();
     super.onClose();
   }
 
@@ -215,14 +231,14 @@ class EegSessionCaptureController extends SintController {
   /// frequency), in addition to the periodic ones.
   void annotateContext(Map<String, dynamic> values) {
     final seg = _segment;
-    if (seg == null) return;
+    if (seg == null || seg.context.length >= _maxSegmentEvents) return;
     seg.context.add(EegContextSample(t: _elapsed(seg), values: Map.of(values)));
   }
 
   /// Records what the host's microphone pipeline reported.
   void noteVoice(EegVoiceEventKind kind, {double? frequencyHz}) {
     final seg = _segment;
-    if (seg == null) return;
+    if (seg == null || seg.voice.length >= _maxSegmentEvents) return;
     seg.voice.add(EegVoiceEvent(t: _elapsed(seg), kind: kind, frequencyHz: frequencyHz));
   }
 
@@ -230,7 +246,7 @@ class EegSessionCaptureController extends SintController {
   /// the report shows what fired even when no recording took the marker.
   void noteAlert(EegAlert alert) {
     final seg = _segment;
-    if (seg == null) return;
+    if (seg == null || seg.alerts.length >= _maxSegmentEvents) return;
     seg.alerts.add(EegAlertNote(
       t: alert.firedAt.difference(seg.startedAt).inMilliseconds / 1000.0,
       ruleId: alert.rule.id,
@@ -297,9 +313,10 @@ class EegSessionCaptureController extends SintController {
   Future<List<EegSessionCapture>> listCaptures() async {
     await _openBox();
     final out = <EegSessionCapture>[];
-    for (final key in _box!.keys) {
-      final json = _box!.get(key);
-      if (json == null) continue;
+    final values = (_box != null && _box!.isOpen)
+        ? _box!.values
+        : _memoryFallback.values;
+    for (final json in values) {
       try {
         out.add(EegSessionCapture.fromJson(Map<String, dynamic>.from(json)));
       } catch (_) {
@@ -307,7 +324,7 @@ class EegSessionCaptureController extends SintController {
       }
     }
     out.sort((a, b) => b.startedAt.compareTo(a.startedAt));
-    captures.assignAll(out);
+    if (!_disposed) captures.assignAll(out);
     return out;
   }
 
@@ -318,21 +335,32 @@ class EegSessionCaptureController extends SintController {
 
   Future<void> deleteCapture(String id) async {
     await _openBox();
-    await _box!.delete(id);
-    captures.removeWhere((c) => c.id == id);
+    if (_box != null && _box!.isOpen) {
+      await _box!.delete(id);
+    } else {
+      _memoryFallback.remove(id);
+    }
+    if (!_disposed) captures.removeWhere((c) => c.id == id);
   }
 
   // ── Ingest ──────────────────────────────────────────────────────────
 
   void _onRaw(EegSample s) {
+    if (_disposed) return;
     _lastSampleAt = DateTime.now();
     _totalSamples++;
     _acc.samples++;
 
     final rate = hub.connectedDevice?.sampleRate ?? 0;
-    if (rate <= 0) return;
-    final cap = (ffrWindow.inMicroseconds * rate / 1000000).round();
+    if (rate <= 0 || ffrWindow <= Duration.zero) return;
+    final cap = (ffrWindow.inMicroseconds * rate / 1000000)
+        .round()
+        .clamp(1, rate * 300);
     for (final e in s.channels.entries) {
+      if (!_rawWindow.containsKey(e.key) &&
+          _rawWindow.length >= _maxRawChannels) {
+        continue;
+      }
       final q = _rawWindow.putIfAbsent(e.key, ListQueue<double>.new);
       q.addLast(e.value.isFinite ? e.value : 0.0);
       while (q.length > cap) {
@@ -341,16 +369,18 @@ class EegSessionCaptureController extends SintController {
     }
   }
 
+  static double _finiteBand(double v) => v.isFinite ? v : 0.0;
+
   void _onBands(List<EegBandPower> frame) {
-    if (frame.isEmpty) return;
+    if (_disposed || frame.isEmpty) return;
     _acc.frames++;
     for (final b in frame) {
-      _acc.delta += b.delta;
-      _acc.theta += b.theta;
-      _acc.alpha += b.alpha;
-      _acc.betaLow += b.betaLow;
-      _acc.betaHigh += b.betaHigh;
-      _acc.gamma += b.gamma;
+      _acc.delta += _finiteBand(b.delta);
+      _acc.theta += _finiteBand(b.theta);
+      _acc.alpha += _finiteBand(b.alpha);
+      _acc.betaLow += _finiteBand(b.betaLow);
+      _acc.betaHigh += _finiteBand(b.betaHigh);
+      _acc.gamma += _finiteBand(b.gamma);
     }
     _acc.channelReadings += frame.length;
 
@@ -465,7 +495,8 @@ class EegSessionCaptureController extends SintController {
         frames: acc.frames,
       ),
     ));
-    while (_rows.length > bufferSeconds) {
+    final maxBuffer = bufferSeconds < 1 ? 1 : bufferSeconds;
+    while (_rows.length > maxBuffer) {
       _rows.removeFirst();
     }
   }
@@ -532,13 +563,37 @@ class EegSessionCaptureController extends SintController {
   // ── Persistence ─────────────────────────────────────────────────────
 
   Future<void> _openBox() async {
-    _box ??= Hive.isBoxOpen(boxName) ? Hive.box<Map>(boxName) : await Hive.openBox<Map>(boxName);
+    if (_box != null && _box!.isOpen) return;
+    if (Hive.isBoxOpen(boxName)) {
+      _box = Hive.box<Map>(boxName);
+      return;
+    }
+    final completer = Completer<Box<Map>?>();
+    runZonedGuarded(
+      () async {
+        try {
+          final box = await Hive.openBox<Map>(boxName);
+          if (!completer.isCompleted) completer.complete(box);
+        } catch (_) {
+          if (!completer.isCompleted) completer.complete(null);
+        }
+      },
+      (_, _) {
+        if (!completer.isCompleted) completer.complete(null);
+      },
+    );
+    _box = await completer.future;
   }
 
   Future<void> _save(EegSessionCapture c) async {
     await _openBox();
-    await _box!.put(c.id, c.toJson());
-    captures.insert(0, c);
+    final data = c.toJson();
+    if (_box != null && _box!.isOpen) {
+      await _box!.put(c.id, data);
+    } else {
+      _memoryFallback[c.id] = data;
+    }
+    if (!_disposed) captures.insert(0, c);
   }
 
   Future<void> _loadCaptures() async {

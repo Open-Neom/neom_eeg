@@ -135,7 +135,7 @@ class MuseBleProvider extends EegDriverBase {
     _device = ble;
 
     try {
-      await ble.connect(timeout: connectTimeout);
+      await ble.connect(license: License.nonprofit, timeout: connectTimeout);
       final services = await ble.discoverServices();
       final museService = services.firstWhere(
         (s) => s.uuid.str128.toLowerCase() == serviceUuid,
@@ -216,10 +216,16 @@ class MuseBleProvider extends EegDriverBase {
 
   // ── BLE plumbing ────────────────────────────────────────────────────
 
-  Future<void> _send(String command) => _control!.write(
-        MusePacketParser.encodeCommand(command),
-        withoutResponse: true,
-      );
+  Future<void> _send(String command) {
+    final ctrl = _control;
+    if (ctrl == null) {
+      throw const EegException('Característica de control Muse no disponible');
+    }
+    return ctrl.write(
+      MusePacketParser.encodeCommand(command),
+      withoutResponse: true,
+    );
+  }
 
   Future<void> _releaseBle() async {
     for (final s in _subs) {
@@ -273,10 +279,22 @@ class MuseBleProvider extends EegDriverBase {
     }
 
     // A channel packet can be lost; flush frames left more than two
-    // counters behind so the stream keeps moving with what arrived.
-    final stale = _frames.keys.where((i) => packet.index - i > 2).toList();
-    for (final i in stale..sort()) {
-      _emitFrame(i, _frames.remove(i)!);
+    // 16-bit counters behind (wraparound-safe) so the stream keeps moving.
+    final stale = _frames.keys.where((i) {
+      final diff = (packet.index - i) & 0xFFFF;
+      return diff > 2 && diff < 0x8000;
+    }).toList();
+    stale.sort((a, b) {
+      final da = (packet.index - a) & 0xFFFF;
+      final db = (packet.index - b) & 0xFFFF;
+      return db.compareTo(da); // Oldest first.
+    });
+    for (final i in stale) {
+      final pending = _frames.remove(i);
+      if (pending != null) _emitFrame(i, pending);
+    }
+    while (_frames.length > 64) {
+      _frames.remove(_frames.keys.first);
     }
   }
 

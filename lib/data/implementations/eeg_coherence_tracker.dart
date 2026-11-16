@@ -88,7 +88,12 @@ class EegCoherenceTracker {
   /// Feeds one sample for [pair]. Returns a reading when a hop boundary is
   /// crossed and at least two segments' worth of signal is buffered.
   EegPairCoherence? push(EegSample sample, EegHemisphericPair pair, int sampleRate) {
-    if (sampleRate <= 0) return null;
+    if (sampleRate <= 0 ||
+        window <= Duration.zero ||
+        !segmentSeconds.isFinite ||
+        segmentSeconds <= 0) {
+      return null;
+    }
     if (_pair != pair || _rate != sampleRate) {
       reset();
       _pair = pair;
@@ -100,14 +105,18 @@ class EegCoherenceTracker {
 
     _left.addLast(l);
     _right.addLast(r);
-    final capacity = (window.inMicroseconds * sampleRate / 1000000).round();
+    final capacity = (window.inMicroseconds * sampleRate / 1000000)
+        .round()
+        .clamp(1, sampleRate * 300);
     while (_left.length > capacity) {
       _left.removeFirst();
       _right.removeFirst();
     }
 
     _sinceHop++;
-    final hopSamples = (hop.inMicroseconds * sampleRate / 1000000).round().clamp(1, 1 << 30);
+    final hopMicros = hop > Duration.zero ? hop.inMicroseconds : 1;
+    final hopSamples =
+        (hopMicros * sampleRate / 1000000).round().clamp(1, 1 << 30);
     if (_sinceHop < hopSamples) return null;
     if (_left.length < 2 * segmentSeconds * sampleRate) return null;
     _sinceHop = 0;

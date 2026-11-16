@@ -109,7 +109,7 @@ class _SessionDrawerState extends State<_SessionDrawer> {
               child: capture == null
                   ? EegSessionTimeline(
                       sessions: _sessions,
-                      onTap: (_) => Navigator.pop(context),
+                      onTap: (_) => Scaffold.maybeOf(context)?.closeDrawer(),
                     )
                   : Obx(() {
                       final items = capture.captures;
@@ -131,10 +131,11 @@ class _SessionDrawerState extends State<_SessionDrawer> {
                         itemBuilder: (_, i) => _CaptureTile(
                           capture: items[i],
                           onTap: () {
-                            Navigator.pop(context);
-                            Navigator.of(context).push(MaterialPageRoute<void>(
-                              builder: (_) => EegSessionReportPage(capture: items[i]),
-                            ));
+                            final selectedCapture = items[i];
+                            Scaffold.maybeOf(context)?.closeDrawer();
+                            Sint.to<void>(
+                              () => EegSessionReportPage(capture: selectedCapture),
+                            );
                           },
                           onDelete: () => capture.deleteCapture(items[i].id),
                         ),

@@ -99,21 +99,55 @@ class EegRecording {
         'metadata': metadata,
       };
 
-  factory EegRecording.fromJson(Map<String, dynamic> json) => EegRecording(
-        id: json['id'] as String,
-        title: json['title'] as String? ?? '',
-        description: json['description'] as String?,
-        subject: json['subject'] as String?,
-        tags: (json['tags'] as List?)?.cast<String>() ?? const [],
-        startedAt: DateTime.parse(json['startedAt'] as String),
-        endedAt: json['endedAt'] != null
-            ? DateTime.parse(json['endedAt'] as String)
-            : null,
-        backend: EegRecordingBackend.values.byName(json['backend'] as String),
-        sampleRate: json['sampleRate'] as int?,
-        markerCount: json['markerCount'] as int? ?? 0,
-        metadata: Map<String, dynamic>.from((json['metadata'] as Map?) ?? {}),
-      );
+  static Map<String, dynamic> _sanitizeDynamicMap(Object? raw) {
+    if (raw is! Map) return const {};
+    final out = <String, dynamic>{};
+    for (final entry in raw.entries.take(128)) {
+      final k = entry.key?.toString() ?? '';
+      final lower = k.toLowerCase();
+      if (k.isEmpty ||
+          lower == '__proto__' ||
+          lower == 'constructor' ||
+          lower == 'prototype') {
+        continue;
+      }
+      out[k] = entry.value;
+    }
+    return out;
+  }
+
+  static int? _finiteIntOrNull(Object? raw) {
+    if (raw is num && raw.isFinite) return raw.toInt();
+    return null;
+  }
+
+  factory EegRecording.fromJson(Map<String, dynamic> json) {
+    final rawBackend = json['backend']?.toString() ?? '';
+    final rawStarted = json['startedAt']?.toString() ?? '';
+    final rawEnded = json['endedAt'];
+    final markerCount = _finiteIntOrNull(json['markerCount']) ?? 0;
+    return EegRecording(
+      id: json['id']?.toString() ?? '',
+      title: json['title']?.toString() ?? '',
+      description: json['description'] as String?,
+      subject: json['subject'] as String?,
+      tags: (json['tags'] as List?)
+              ?.take(64)
+              .whereType<String>()
+              .toList() ??
+          const [],
+      startedAt: DateTime.tryParse(rawStarted) ??
+          DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+      endedAt: rawEnded is String ? DateTime.tryParse(rawEnded) : null,
+      backend: EegRecordingBackend.values.firstWhere(
+        (b) => b.name == rawBackend,
+        orElse: () => EegRecordingBackend.local,
+      ),
+      sampleRate: _finiteIntOrNull(json['sampleRate']),
+      markerCount: markerCount < 0 ? 0 : markerCount,
+      metadata: _sanitizeDynamicMap(json['metadata']),
+    );
+  }
 }
 
 /// An event pinned to the EEG timeline — an aura, a symptom, a stimulus,
@@ -151,15 +185,23 @@ class EegMarker {
         'recordingId': recordingId,
       };
 
-  factory EegMarker.fromJson(Map<String, dynamic> json) => EegMarker(
-        id: json['id'] as String,
-        label: json['label'] as String,
-        value: json['value'] as Object? ?? 1,
-        at: DateTime.parse(json['at'] as String),
-        port: json['port'] as String? ?? 'Software',
-        extras: Map<String, dynamic>.from((json['extras'] as Map?) ?? {}),
-        recordingId: json['recordingId'] as String?,
-      );
+  factory EegMarker.fromJson(Map<String, dynamic> json) {
+    final rawAt = json['at']?.toString() ?? '';
+    final rawVal = json['value'];
+    final Object safeVal = (rawVal is num && !rawVal.isFinite)
+        ? 1
+        : (rawVal as Object? ?? 1);
+    return EegMarker(
+      id: json['id']?.toString() ?? '',
+      label: json['label']?.toString() ?? '',
+      value: safeVal,
+      at: DateTime.tryParse(rawAt) ??
+          DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+      port: json['port']?.toString() ?? 'Software',
+      extras: EegRecording._sanitizeDynamicMap(json['extras']),
+      recordingId: json['recordingId'] as String?,
+    );
+  }
 }
 
 class EegExportResult {

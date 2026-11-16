@@ -62,6 +62,8 @@ class EegCalibrationController extends SintController {
   Completer<EegCalibration?>? _running;
   DateTime _phaseStartedAt = DateTime.now();
   Box<Map>? _box;
+  final Map<String, Map<String, dynamic>> _memoryFallback = {};
+  bool _disposed = false;
 
   bool get isRunning => _running != null && !_running!.isCompleted;
 
@@ -69,6 +71,7 @@ class EegCalibrationController extends SintController {
   void onInit() {
     super.onInit();
     _connectionSub = hub.connectionStateStream.listen((state) {
+      if (_disposed) return;
       if (state == EegConnectionState.streaming) {
         unawaited(load());
       } else if (state == EegConnectionState.disconnected ||
@@ -82,9 +85,22 @@ class EegCalibrationController extends SintController {
 
   @override
   void onClose() {
+    if (_disposed) return;
+    _disposed = true;
     _timer?.cancel();
+    _timer = null;
     _connectionSub?.cancel();
+    _connectionSub = null;
     _stopListening();
+    final c = _running;
+    _running = null;
+    if (c != null && !c.isCompleted) c.complete(null);
+    phase.close();
+    remainingSeconds.close();
+    progress.close();
+    frames.close();
+    error.close();
+    current.close();
     super.onClose();
   }
 
@@ -99,12 +115,18 @@ class EegCalibrationController extends SintController {
     bool includeEyesClosed = true,
     Duration settle = const Duration(seconds: 3),
   }) async {
+    if (_disposed) return null;
     if (hub.connectionState != EegConnectionState.streaming) {
       throw const EegException('Conecta un headset antes de calibrar');
     }
+    if (eyesOpen <= Duration.zero) {
+      throw const EegException('La fase de ojos abiertos debe ser > 0 s');
+    }
     if (isRunning) await cancel();
 
-    final closed = includeEyesClosed ? eyesClosed : Duration.zero;
+    final closed = includeEyesClosed && eyesClosed > Duration.zero
+        ? eyesClosed
+        : Duration.zero;
     final total = eyesOpen + closed;
     _builder.reset();
     frames.value = 0;
@@ -211,12 +233,16 @@ class EegCalibrationController extends SintController {
   /// Loads the baseline for the connected model (or [type]) and the current
   /// subject into [current]. Null when none was saved.
   Future<EegCalibration?> load({EegDeviceType? type}) async {
+    if (_disposed) return null;
     final t = type ?? hub.connectedDevice?.type;
+    final key = EegCalibration.keyFor(subjectId?.call(), t);
     try {
       await _openBox();
-      final json = _box!.get(EegCalibration.keyFor(subjectId?.call(), t));
+      final json = (_box != null && _box!.isOpen)
+          ? _box!.get(key)
+          : _memoryFallback[key];
       final cal = json == null ? null : EegCalibration.fromJson(Map<String, dynamic>.from(json));
-      current.value = cal;
+      if (!_disposed) current.value = cal;
       return cal;
     } catch (_) {
       // Hive not initialised (tests, early boot) or an older schema.
@@ -227,7 +253,12 @@ class EegCalibrationController extends SintController {
   Future<void> save(EegCalibration calibration) async {
     try {
       await _openBox();
-      await _box!.put(calibration.key, calibration.toJson());
+      final data = calibration.toJson();
+      if (_box != null && _box!.isOpen) {
+        await _box!.put(calibration.key, data);
+      } else {
+        _memoryFallback[calibration.key] = data;
+      }
     } catch (_) {
       // Without Hive the baseline lives in [current] for this session only.
     }
@@ -236,9 +267,14 @@ class EegCalibrationController extends SintController {
   /// Forgets the saved baseline for the connected model and subject.
   Future<void> clear({EegDeviceType? type}) async {
     final t = type ?? hub.connectedDevice?.type;
+    final key = EegCalibration.keyFor(subjectId?.call(), t);
     await _openBox();
-    await _box!.delete(EegCalibration.keyFor(subjectId?.call(), t));
-    if (current.value?.key == EegCalibration.keyFor(subjectId?.call(), t)) {
+    if (_box != null && _box!.isOpen) {
+      await _box!.delete(key);
+    } else {
+      _memoryFallback.remove(key);
+    }
+    if (!_disposed && current.value?.key == key) {
       current.value = null;
     }
   }
@@ -247,9 +283,10 @@ class EegCalibrationController extends SintController {
   Future<List<EegCalibration>> listAll() async {
     await _openBox();
     final out = <EegCalibration>[];
-    for (final key in _box!.keys) {
-      final json = _box!.get(key);
-      if (json == null) continue;
+    final values = (_box != null && _box!.isOpen)
+        ? _box!.values
+        : _memoryFallback.values;
+    for (final json in values) {
       try {
         out.add(EegCalibration.fromJson(Map<String, dynamic>.from(json)));
       } catch (_) {
@@ -261,6 +298,25 @@ class EegCalibrationController extends SintController {
   }
 
   Future<void> _openBox() async {
-    _box ??= Hive.isBoxOpen(boxName) ? Hive.box<Map>(boxName) : await Hive.openBox<Map>(boxName);
+    if (_box != null && _box!.isOpen) return;
+    if (Hive.isBoxOpen(boxName)) {
+      _box = Hive.box<Map>(boxName);
+      return;
+    }
+    final completer = Completer<Box<Map>?>();
+    runZonedGuarded(
+      () async {
+        try {
+          final box = await Hive.openBox<Map>(boxName);
+          if (!completer.isCompleted) completer.complete(box);
+        } catch (_) {
+          if (!completer.isCompleted) completer.complete(null);
+        }
+      },
+      (_, _) {
+        if (!completer.isCompleted) completer.complete(null);
+      },
+    );
+    _box = await completer.future;
   }
 }

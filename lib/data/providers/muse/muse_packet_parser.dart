@@ -49,16 +49,16 @@ class MusePacketParser {
   static MuseEegPacket? parseEeg(List<int> bytes) {
     if (bytes.length < packetLength) return null;
 
-    final index = (bytes[0] << 8) | bytes[1];
+    final index = ((bytes[0] & 0xFF) << 8) | (bytes[1] & 0xFF);
     final samples = List<double>.filled(samplesPerPacket, 0.0);
 
     // 12-bit fields alternate between byte-aligned and nibble-aligned.
     var bit = 16;
     for (var i = 0; i < samplesPerPacket; i++) {
       final b = bit >> 3;
-      final raw = (bit & 7) == 0
-          ? (bytes[b] << 4) | (bytes[b + 1] >> 4)
-          : ((bytes[b] & 0x0F) << 8) | bytes[b + 1];
+      final b0 = bytes[b] & 0xFF;
+      final b1 = bytes[b + 1] & 0xFF;
+      final raw = (bit & 7) == 0 ? (b0 << 4) | (b1 >> 4) : ((b0 & 0x0F) << 8) | b1;
       samples[i] = microvoltsPerCount * (raw - midpoint);
       bit += 12;
     }
@@ -69,7 +69,7 @@ class MusePacketParser {
   /// fuel gauge (×2.2 = mV), ADC volts, temperature (°C).
   static MuseTelemetry? parseTelemetry(List<int> bytes) {
     if (bytes.length < 10) return null;
-    int u16(int at) => (bytes[at] << 8) | bytes[at + 1];
+    int u16(int at) => ((bytes[at] & 0xFF) << 8) | (bytes[at + 1] & 0xFF);
     return MuseTelemetry(
       index: u16(0),
       battery: (u16(2) / 512.0 / 100.0).clamp(0.0, 1.0),
@@ -81,6 +81,24 @@ class MusePacketParser {
   /// Control-characteristic framing: length byte (chars + newline), ASCII
   /// command, `\n`. `h` halt · `d` resume · `s` start · `p21` EEG-only
   /// preset · `p20` EEG + AUX · `v1` firmware info · `k` keep-alive.
-  static List<int> encodeCommand(String command) =>
-      [command.length + 1, ...command.codeUnits, 0x0A];
+  static List<int> encodeCommand(String command) {
+    if (command.isEmpty || command.length > 254) {
+      throw ArgumentError.value(
+        command,
+        'command',
+        'Muse GATT command must be 1..254 ASCII bytes',
+      );
+    }
+    final units = command.codeUnits;
+    for (final c in units) {
+      if (c < 0x20 || c >= 0x7F) {
+        throw ArgumentError.value(
+          command,
+          'command',
+          'Muse GATT command must contain single-line printable ASCII only',
+        );
+      }
+    }
+    return [units.length + 1, ...units, 0x0A];
+  }
 }

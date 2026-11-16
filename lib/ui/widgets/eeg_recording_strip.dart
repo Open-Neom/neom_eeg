@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:sint/sint.dart';
 
 import '../../domain/models/eeg_recording.dart';
 import '../../domain/use_cases/eeg_recording_service.dart';
@@ -109,15 +110,15 @@ class _EegRecordingStripState extends State<EegRecordingStrip> {
             hintText: 'Etiqueta (p. ej. "déjà vu", "mareo")',
             hintStyle: TextStyle(color: Colors.white38),
           ),
-          onSubmitted: (v) => Navigator.of(ctx).pop(v),
+          onSubmitted: (v) => Sint.pop(v),
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(ctx).pop(),
+            onPressed: () => Sint.pop(),
             child: const Text('Cancelar'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(ctx).pop(controller.text),
+            onPressed: () => Sint.pop(controller.text),
             child: const Text('Marcar'),
           ),
         ],
