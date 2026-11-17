@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import '../../domain/models/eeg_asymmetry.dart';
 import '../../domain/models/eeg_band_power.dart';
 import '../../domain/models/eeg_calibration.dart';
@@ -28,22 +30,24 @@ class EegSignalProcessor implements EegProcessorService {
     // The driver knows its rate; timestamps are only the fallback, and n
     // samples span n − 1 intervals.
     final spanMs = samples.last.timestamp
-        .difference(samples.first.timestamp)
-        .inMicroseconds /
+            .difference(samples.first.timestamp)
+            .inMicroseconds /
         1000.0;
     final rate = sampleRate ??
         (spanMs > 0 && n > 1 ? (n - 1) * 1000.0 / spanMs : 128.0);
+    final signal = Float64List(n);
 
     return channels.map((ch) {
-      final signal = [
-        for (final s in samples) (s.channels[ch.name] ?? 0.0),
-      ];
+      final label = ch.name;
+      for (var i = 0; i < n; i++) {
+        signal[i] = samples[i].channels[label] ?? 0.0;
+      }
       // Detrended, Hann-windowed spectrum (EegSpectral): electrode drift
       // and the DC offset no longer leak into delta/theta.
       final spectrum = EegSpectral.powerSpectrum(signal, rate);
 
       return EegBandPower(
-        channel: ch.name,
+        channel: label,
         delta: spectrum.band('delta'),
         theta: spectrum.band('theta'),
         alpha: spectrum.band('alpha'),
@@ -53,6 +57,36 @@ class EegSignalProcessor implements EegProcessorService {
         timestamp: now,
       );
     }).toList();
+  }
+
+  /// Zero-allocation fast path extracting band powers directly from contiguous
+  /// per-channel signal windows (e.g. [Float64List] slices from a ring buffer
+  /// or background DSP isolate).
+  List<EegBandPower> extractBandPowerFromWindows(
+    Map<String, List<double>> channelSignals,
+    List<String> channelOrder,
+    double sampleRate, {
+    DateTime? timestamp,
+  }) {
+    if (channelSignals.isEmpty || channelOrder.isEmpty) return const [];
+    final now = timestamp ?? DateTime.now();
+    final out = <EegBandPower>[];
+    for (final label in channelOrder) {
+      final signal = channelSignals[label];
+      if (signal == null || signal.isEmpty) continue;
+      final spectrum = EegSpectral.powerSpectrum(signal, sampleRate);
+      out.add(EegBandPower(
+        channel: label,
+        delta: spectrum.band('delta'),
+        theta: spectrum.band('theta'),
+        alpha: spectrum.band('alpha'),
+        betaLow: spectrum.band('betaLow'),
+        betaHigh: spectrum.band('betaHigh'),
+        gamma: spectrum.band('gamma'),
+        timestamp: now,
+      ));
+    }
+    return out;
   }
 
   @override

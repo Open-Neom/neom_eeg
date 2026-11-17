@@ -18,6 +18,7 @@ import '../../domain/use_cases/eeg_device_service.dart';
 import '../../domain/use_cases/eeg_driver.dart';
 import '../../domain/use_cases/eeg_processor_service.dart';
 import '../../domain/use_cases/eeg_recording_service.dart';
+import '../implementations/dsp_isolate/eeg_dsp_isolate.dart';
 import '../implementations/eeg_band_power_deriver.dart';
 import '../implementations/eeg_coherence_tracker.dart';
 import '../implementations/eeg_metrics_estimator.dart';
@@ -100,9 +101,14 @@ class EegHub implements EegDeviceService {
   /// "no contact" (0) is removed by default. Set to 0 to disable. Raw
   /// samples are never filtered; their `quality` map carries the CQ instead.
   final double minContactQuality;
+  final bool offloadDspToIsolate;
+  final Duration _derivedWindow;
+  final Duration _derivedHop;
   final EegBandPowerDeriver _deriver;
   final EegMetricsEstimator _estimator;
   final EegCoherenceTracker _coherence;
+  EegDspIsolateClient? _dspIsolate;
+  bool _activeEstimateMetrics = false;
   EegHemisphericPair? _analysisPair;
   EegPairCoherence? _lastCoherence;
 
@@ -125,19 +131,41 @@ class EegHub implements EegDeviceService {
     required this.registry,
     this.bandPowerMode = EegBandPowerMode.auto,
     this.minContactQuality = 0.25,
+    bool offloadDspToIsolate = false,
     EegProcessorService? processor,
     Duration derivedWindow = const Duration(seconds: 1),
     Duration derivedHop = const Duration(milliseconds: 250),
     EegMetricsEstimator? estimator,
     EegCoherenceTracker? coherenceTracker,
   })  : processor = processor ?? EegSignalProcessor(),
+        offloadDspToIsolate = offloadDspToIsolate &&
+            EegDspIsolateClient.isSupported &&
+            (processor == null || processor is EegSignalProcessor),
+        _derivedWindow = derivedWindow,
+        _derivedHop = derivedHop,
         _coherence = coherenceTracker ?? EegCoherenceTracker(),
         _deriver = EegBandPowerDeriver(
           processor: processor ?? EegSignalProcessor(),
           window: derivedWindow,
           hop: derivedHop,
         ),
-        _estimator = estimator ?? EegMetricsEstimator();
+        _estimator = estimator ?? EegMetricsEstimator() {
+    if (this.offloadDspToIsolate) {
+      _dspIsolate = EegDspIsolateClient(
+        onBandPower: (frame) {
+          if (!_disposed && _active != null) {
+            _publishBandPower(frame, _activeEstimateMetrics);
+          }
+        },
+        onCoherence: (coherence) {
+          if (!_disposed && _active != null && coherence.pair == _analysisPair) {
+            _lastCoherence = coherence;
+            _coherenceCtl.add(coherence);
+          }
+        },
+      );
+    }
+  }
 
   /// Hub with the stock drivers.
   ///
@@ -157,6 +185,7 @@ class EegHub implements EegDeviceService {
     bool includeSimulated = kDebugMode,
     EegBandPowerMode bandPowerMode = EegBandPowerMode.auto,
     double minContactQuality = 0.25,
+    bool? offloadDspToIsolate,
     EegProcessorService? processor,
   }) {
     final registry = EegDriverRegistry([
@@ -178,7 +207,27 @@ class EegHub implements EegDeviceService {
       registry: registry,
       bandPowerMode: bandPowerMode,
       minContactQuality: minContactQuality,
+      offloadDspToIsolate: offloadDspToIsolate ?? !kIsWeb,
       processor: processor,
+    );
+  }
+
+  /// Whether spectral DSP is actively offloaded to a background [Isolate].
+  bool get isDspIsolateActive => _dspIsolate?.isActive ?? false;
+
+  /// Flushes any micro-batched samples pending in the background DSP isolate.
+  Future<void> flushDspIsolate() => _dspIsolate?.flush() ?? Future<void>.value();
+
+  /// Computes stimulus frequency-following SNR on the background DSP isolate
+  /// when active; returns `null` when isolate offload is disabled or idle.
+  Future<({double snr, double hz})?> computeIsolateFfr({
+    required double stimulusHz,
+  }) {
+    final iso = _dspIsolate;
+    if (iso == null || !iso.isActive) return Future.value(null);
+    return iso.computeFfr(
+      stimulusHz: stimulusHz,
+      excludedChannels: excludedChannels,
     );
   }
 
@@ -385,6 +434,8 @@ class EegHub implements EegDeviceService {
     if (_disposed) return;
     await disconnect();
     _disposed = true;
+    await _dspIsolate?.dispose();
+    _dspIsolate = null;
     await _localRecording?.dispose();
     await registry.dispose();
     await Future.wait([
@@ -407,16 +458,37 @@ class EegHub implements EegDeviceService {
       EegBandPowerMode.auto => !caps.nativeBandPower,
     };
     final estimateMetrics = !caps.nativeMentalMetrics;
+    _activeEstimateMetrics = estimateMetrics;
 
     _deriver.reset();
     _estimator.reset();
     _coherence.reset();
     _excluded = const {};
     _lastCoherence = null;
-    _updateAnalysisPair(driver.connectedDevice ?? device);
+    final activeDevice = driver.connectedDevice ?? device;
+    _updateAnalysisPair(activeDevice);
+
+    final dspIsolate = _dspIsolate;
+    if (dspIsolate != null) {
+      unawaited(dspIsolate.configure(
+        channelNames: activeDevice.channelLabels,
+        sampleRate: activeDevice.sampleRate,
+        deriveBandPower: deriveBandPower,
+        bandWindow: _derivedWindow,
+        bandHop: _derivedHop,
+        coherenceWindow: _coherence.window,
+        coherenceHop: _coherence.hop,
+        coherenceSegmentSeconds: _coherence.segmentSeconds,
+        analysisPair: _analysisPair,
+      ));
+    }
 
     _forwarders.add(driver.rawStream.listen((sample) {
       _raw.add(sample);
+      if (dspIsolate != null) {
+        dspIsolate.pushSample(sample);
+        return;
+      }
       final pair = _analysisPair;
       if (pair != null) {
         final rate = driver.connectedDevice?.sampleRate ?? device.sampleRate;
@@ -486,6 +558,7 @@ class EegHub implements EegDeviceService {
       s.cancel();
     }
     _forwarders.clear();
+    _dspIsolate?.reset();
     _coherence.reset();
     _analysisPair = null;
     _lastCoherence = null;
@@ -499,6 +572,7 @@ class EegHub implements EegDeviceService {
       // A reading from the previous pair would be mislabelled.
       _lastCoherence = null;
       _coherence.reset();
+      _dspIsolate?.updatePair(next);
     }
   }
 

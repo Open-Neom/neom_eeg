@@ -111,6 +111,8 @@ export 'data/providers/simulated_eeg_provider.dart';
 export 'data/implementations/eeg_connection_controller.dart';
 export 'data/implementations/eeg_signal_processor.dart';
 export 'data/implementations/eeg_spectral.dart';
+export 'data/implementations/eeg_ring_buffer.dart';
+export 'data/implementations/dsp_isolate/eeg_dsp_isolate.dart';
 export 'data/implementations/eeg_coherence_tracker.dart';
 export 'data/implementations/eeg_band_power_deriver.dart';
 export 'data/implementations/eeg_metrics_estimator.dart';

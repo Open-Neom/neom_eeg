@@ -1,8 +1,9 @@
 import 'dart:async';
-import 'dart:collection';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 
+import '../../data/implementations/eeg_ring_buffer.dart';
 import '../../domain/models/eeg_sample.dart';
 
 /// Oscilloscope-style raw EEG waveform display.
@@ -31,7 +32,8 @@ class _EegRawWaveState extends State<EegRawWave> {
   /// buffer fills continuously and the canvas refreshes at ~30 fps.
   static const _repaintInterval = Duration(milliseconds: 33);
 
-  final _buffer = ListQueue<double>(_bufferSize);
+  final _buffer = EegFloat64RingBuffer(_bufferSize);
+  Float64List _paintScratch = Float64List(0);
   StreamSubscription<EegSample>? _sub;
   Timer? _repaint;
   bool _dirty = false;
@@ -64,10 +66,7 @@ class _EegRawWaveState extends State<EegRawWave> {
   void _subscribe() {
     _sub = widget.rawStream.listen((sample) {
       final value = sample.channels[widget.selectedChannel] ?? 0.0;
-      if (_buffer.length >= _bufferSize) {
-        _buffer.removeFirst();
-      }
-      _buffer.addLast(value);
+      _buffer.push(value.isFinite ? value : 0.0);
       _dirty = true;
     });
   }
@@ -81,6 +80,10 @@ class _EegRawWaveState extends State<EegRawWave> {
 
   @override
   Widget build(BuildContext context) {
+    if (_paintScratch.length != _buffer.length) {
+      _paintScratch = Float64List(_buffer.length);
+    }
+    final snapshot = _buffer.toFloat64List(_paintScratch);
     return Container(
       height: 120,
       decoration: BoxDecoration(
@@ -94,7 +97,7 @@ class _EegRawWaveState extends State<EegRawWave> {
           children: [
             CustomPaint(
               size: const Size(double.infinity, 120),
-              painter: _WavePainter(samples: _buffer.toList()),
+              painter: _WavePainter(samples: snapshot),
             ),
             // Labels
             Positioned(

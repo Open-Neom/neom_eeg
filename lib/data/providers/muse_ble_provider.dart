@@ -53,6 +53,13 @@ class MuseBleProvider extends EegDriverBase {
   int? _lastEmittedIndex;
   DateTime? _clockOrigin;
   int _clockSamples = 0;
+  Map<String, double>? _lastStatusQualityRef;
+  Map<String, double> _cachedFullQuality = const {
+    'TP9': 1.0,
+    'AF7': 1.0,
+    'AF8': 1.0,
+    'TP10': 1.0,
+  };
 
   MuseBleProvider({this.connectTimeout = const Duration(seconds: 15)});
 
@@ -280,21 +287,30 @@ class MuseBleProvider extends EegDriverBase {
 
     // A channel packet can be lost; flush frames left more than two
     // 16-bit counters behind (wraparound-safe) so the stream keeps moving.
-    final stale = _frames.keys.where((i) {
-      final diff = (packet.index - i) & 0xFFFF;
-      return diff > 2 && diff < 0x8000;
-    }).toList();
-    stale.sort((a, b) {
-      final da = (packet.index - a) & 0xFFFF;
-      final db = (packet.index - b) & 0xFFFF;
-      return db.compareTo(da); // Oldest first.
-    });
-    for (final i in stale) {
-      final pending = _frames.remove(i);
-      if (pending != null) _emitFrame(i, pending);
-    }
-    while (_frames.length > 64) {
-      _frames.remove(_frames.keys.first);
+    if (_frames.isNotEmpty) {
+      List<int>? stale;
+      for (final i in _frames.keys) {
+        final diff = (packet.index - i) & 0xFFFF;
+        if (diff > 2 && diff < 0x8000) {
+          (stale ??= <int>[]).add(i);
+        }
+      }
+      if (stale != null) {
+        if (stale.length > 1) {
+          stale.sort((a, b) {
+            final da = (packet.index - a) & 0xFFFF;
+            final db = (packet.index - b) & 0xFFFF;
+            return db.compareTo(da); // Oldest first.
+          });
+        }
+        for (final i in stale) {
+          final pending = _frames.remove(i);
+          if (pending != null) _emitFrame(i, pending);
+        }
+      }
+      while (_frames.length > 64) {
+        _frames.remove(_frames.keys.first);
+      }
     }
   }
 
@@ -310,7 +326,19 @@ class MuseBleProvider extends EegDriverBase {
     // into the data.
     _clockOrigin ??= DateTime.now();
     final origin = _clockOrigin!;
-    final quality = lastStatus?.contactQuality ?? const {};
+    final quality = lastStatus?.contactQuality ?? const <String, double>{};
+    if (!identical(quality, _lastStatusQualityRef)) {
+      _lastStatusQualityRef = quality;
+      _cachedFullQuality = Map.unmodifiable({
+        for (final label in electrodeUuids.values) label: quality[label] ?? 1.0,
+      });
+    }
+    final isFullFrame = frame.length == electrodeUuids.length;
+    final sharedQuality = isFullFrame
+        ? _cachedFullQuality
+        : Map<String, double>.unmodifiable({
+            for (final ch in frame.keys) ch: quality[ch] ?? 1.0,
+          });
 
     for (var i = 0; i < MusePacketParser.samplesPerPacket; i++) {
       final channels = <String, double>{
@@ -322,7 +350,9 @@ class MuseBleProvider extends EegDriverBase {
           Duration(microseconds: _clockSamples * _samplePeriodUs),
         ),
         channels: channels,
-        quality: {for (final ch in channels.keys) ch: quality[ch] ?? 1.0},
+        quality: channels.length == frame.length
+            ? sharedQuality
+            : {for (final ch in channels.keys) ch: quality[ch] ?? 1.0},
       ));
       _clockSamples++;
     }

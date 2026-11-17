@@ -52,7 +52,21 @@ class EegPracticeLink {
   /// Whether the host is capturing the microphone.
   final RxBool? voiceCapturing;
 
+  /// Optional minimum interval between reactive context annotations
+  /// (leading + trailing throttle). Prevents 60–120 Hz slider sweeps from
+  /// flooding the capture log during long meditation sessions while keeping
+  /// single discrete changes immediate.
+  final Duration annotationMinInterval;
+
+  /// Optional minimum interval and pitch delta (`Hz`) for vocal pitch events.
+  final Duration voiceMinInterval;
+  final double voiceMinDeltaHz;
+
   final _subs = <StreamSubscription<dynamic>>[];
+  Timer? _pendingAnnotationTimer;
+  DateTime? _lastAnnotationAt;
+  DateTime? _lastVoiceAt;
+  double? _lastVoiceHz;
   bool _attached = false;
 
   EegPracticeLink({
@@ -64,6 +78,9 @@ class EegPracticeLink {
     this.annotateOn = const [],
     this.detectedVoiceHz,
     this.voiceCapturing,
+    this.annotationMinInterval = Duration.zero,
+    this.voiceMinInterval = Duration.zero,
+    this.voiceMinDeltaHz = 0.0,
   }) : sessionIdOf = sessionIdOf ?? _defaultSessionId;
 
   static String _defaultSessionId(DateTime startedAt) =>
@@ -71,12 +88,51 @@ class EegPracticeLink {
 
   bool get isAttached => _attached;
 
+  void _flushPendingAnnotation() {
+    if (_pendingAnnotationTimer == null) return;
+    _pendingAnnotationTimer?.cancel();
+    _pendingAnnotationTimer = null;
+    if (capture.segmentOpen.value) {
+      _lastAnnotationAt = DateTime.now();
+      capture.annotateContext(context());
+    }
+  }
+
+  void _scheduleOrEmitAnnotation() {
+    if (!capture.segmentOpen.value) return;
+    if (annotationMinInterval <= Duration.zero) {
+      capture.annotateContext(context());
+      return;
+    }
+    final now = DateTime.now();
+    final last = _lastAnnotationAt;
+    if (last == null || now.difference(last) >= annotationMinInterval) {
+      _pendingAnnotationTimer?.cancel();
+      _pendingAnnotationTimer = null;
+      _lastAnnotationAt = now;
+      capture.annotateContext(context());
+      return;
+    }
+    if (_pendingAnnotationTimer != null) return;
+    final remaining = annotationMinInterval - now.difference(last);
+    _pendingAnnotationTimer = Timer(remaining, () {
+      _pendingAnnotationTimer = null;
+      if (_attached && capture.segmentOpen.value) {
+        _lastAnnotationAt = DateTime.now();
+        capture.annotateContext(context());
+      }
+    });
+  }
+
   void attach() {
     if (_attached) return;
     _attached = true;
 
     _subs.add(isPlaying.listen((playing) {
       if (playing) {
+        _lastAnnotationAt = null;
+        _lastVoiceAt = null;
+        _lastVoiceHz = null;
         final started = sessionStartedAt() ?? DateTime.now();
         unawaited(capture.startSegment(
           practiceSessionId: sessionIdOf(started),
@@ -84,28 +140,40 @@ class EegPracticeLink {
           startedAt: started,
         ));
       } else {
+        _flushPendingAnnotation();
         unawaited(capture.endSegment());
       }
     }));
 
     for (final rx in annotateOn) {
-      _subs.add(rx.listen((_) {
-        if (capture.segmentOpen.value) capture.annotateContext(context());
-      }));
+      _subs.add(rx.listen((_) => _scheduleOrEmitAnnotation()));
     }
 
     final voice = detectedVoiceHz;
     if (voice != null) {
       _subs.add(voice.listen((hz) {
-        if (hz > 0) {
-          capture.noteVoice(EegVoiceEventKind.detected, frequencyHz: hz);
+        if (hz <= 0 || !hz.isFinite) {
+          _lastVoiceHz = null;
+          return;
         }
+        if (voiceMinInterval > Duration.zero || voiceMinDeltaHz > 0) {
+          final now = DateTime.now();
+          final withinInterval = _lastVoiceAt != null &&
+              now.difference(_lastVoiceAt!) < voiceMinInterval;
+          final smallDelta = _lastVoiceHz != null &&
+              (hz - _lastVoiceHz!).abs() < voiceMinDeltaHz;
+          if (withinInterval && smallDelta) return;
+          _lastVoiceAt = now;
+          _lastVoiceHz = hz;
+        }
+        capture.noteVoice(EegVoiceEventKind.detected, frequencyHz: hz);
       }));
     }
 
     final capturing = voiceCapturing;
     if (capturing != null) {
       _subs.add(capturing.listen((on) {
+        _lastVoiceHz = null;
         capture.noteVoice(
           on ? EegVoiceEventKind.captureStarted : EegVoiceEventKind.captureStopped,
         );
@@ -125,6 +193,7 @@ class EegPracticeLink {
 
   void detach() {
     if (!_attached) return;
+    _flushPendingAnnotation();
     _attached = false;
     for (final s in _subs) {
       s.cancel();

@@ -1,7 +1,8 @@
-import 'dart:collection';
+import 'dart:typed_data';
 
 import '../../domain/models/eeg_channel_catalog.dart';
 import '../../domain/models/eeg_sample.dart';
+import 'eeg_ring_buffer.dart';
 import 'eeg_spectral.dart';
 
 /// Spectral coherence between the two electrodes of a hemispheric pair
@@ -70,8 +71,10 @@ class EegCoherenceTracker {
     this.segmentSeconds = 1.0,
   });
 
-  final _left = ListQueue<double>();
-  final _right = ListQueue<double>();
+  EegFloat64RingBuffer? _left;
+  EegFloat64RingBuffer? _right;
+  Float64List? _scratchLeft;
+  Float64List? _scratchRight;
   EegHemisphericPair? _pair;
   int _rate = 0;
   int _sinceHop = 0;
@@ -79,51 +82,70 @@ class EegCoherenceTracker {
   EegHemisphericPair? get pair => _pair;
 
   void reset() {
-    _left.clear();
-    _right.clear();
+    _left?.clear();
+    _right?.clear();
     _pair = null;
     _sinceHop = 0;
   }
 
   /// Feeds one sample for [pair]. Returns a reading when a hop boundary is
   /// crossed and at least two segments' worth of signal is buffered.
-  EegPairCoherence? push(EegSample sample, EegHemisphericPair pair, int sampleRate) {
+  EegPairCoherence? push(EegSample sample, EegHemisphericPair pair, int sampleRate) =>
+      pushValues(
+        sample.channels[pair.left],
+        sample.channels[pair.right],
+        pair,
+        sampleRate,
+      );
+
+  /// Zero-map fast path accepting the pair's raw electrode values directly.
+  EegPairCoherence? pushValues(
+    double? l,
+    double? r,
+    EegHemisphericPair pair,
+    int sampleRate,
+  ) {
     if (sampleRate <= 0 ||
         window <= Duration.zero ||
         !segmentSeconds.isFinite ||
         segmentSeconds <= 0) {
       return null;
     }
+    final capacity = (window.inMicroseconds * sampleRate / 1000000)
+        .round()
+        .clamp(1, sampleRate * 300);
     if (_pair != pair || _rate != sampleRate) {
       reset();
       _pair = pair;
       _rate = sampleRate;
+      (_left ??= EegFloat64RingBuffer(capacity)).ensureCapacity(capacity);
+      (_right ??= EegFloat64RingBuffer(capacity)).ensureCapacity(capacity);
     }
-    final l = sample.channels[pair.left];
-    final r = sample.channels[pair.right];
     if (l == null || r == null || !l.isFinite || !r.isFinite) return null;
 
-    _left.addLast(l);
-    _right.addLast(r);
-    final capacity = (window.inMicroseconds * sampleRate / 1000000)
-        .round()
-        .clamp(1, sampleRate * 300);
-    while (_left.length > capacity) {
-      _left.removeFirst();
-      _right.removeFirst();
-    }
+    final leftRing = (_left ??= EegFloat64RingBuffer(capacity))
+      ..ensureCapacity(capacity);
+    final rightRing = (_right ??= EegFloat64RingBuffer(capacity))
+      ..ensureCapacity(capacity);
+    leftRing.push(l);
+    rightRing.push(r);
 
     _sinceHop++;
     final hopMicros = hop > Duration.zero ? hop.inMicroseconds : 1;
     final hopSamples =
         (hopMicros * sampleRate / 1000000).round().clamp(1, 1 << 30);
     if (_sinceHop < hopSamples) return null;
-    if (_left.length < 2 * segmentSeconds * sampleRate) return null;
+    final n = leftRing.length;
+    if (n < 2 * segmentSeconds * sampleRate) return null;
     _sinceHop = 0;
 
+    if (_scratchLeft == null || _scratchLeft!.length != n) {
+      _scratchLeft = Float64List(n);
+      _scratchRight = Float64List(n);
+    }
     final spec = EegSpectral.coherence(
-      _left.toList(),
-      _right.toList(),
+      leftRing.toFloat64List(_scratchLeft),
+      rightRing.toFloat64List(_scratchRight),
       sampleRate.toDouble(),
       segmentSeconds: segmentSeconds,
     );
@@ -145,7 +167,7 @@ class EegCoherenceTracker {
         for (final b in EegBands.coherenceBands)
           if (spec.bandSignificance(b) != null) b: spec.bandSignificance(b)!,
       },
-      window: Duration(microseconds: (_left.length * 1000000 / sampleRate).round()),
+      window: Duration(microseconds: (n * 1000000 / sampleRate).round()),
       at: DateTime.now(),
     );
   }

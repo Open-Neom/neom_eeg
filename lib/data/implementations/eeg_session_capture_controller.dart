@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:typed_data';
 
 import 'package:hive/hive.dart';
 import 'package:sint/sint.dart';
@@ -17,6 +18,7 @@ import '../../domain/models/eeg_watch_rule.dart';
 import '../../domain/use_cases/eeg_recording_service.dart';
 import '../hub/eeg_hub.dart';
 import 'eeg_indices.dart';
+import 'eeg_ring_buffer.dart';
 import 'eeg_spectral.dart';
 
 /// Real-time health of the EEG link, refreshed every second.
@@ -110,7 +112,10 @@ class EegSessionCaptureController extends SintController {
   DateTime? _lastSampleAt;
   int _totalSamples = 0;
   EegMentalState? _lastMetrics;
-  final _rawWindow = <String, ListQueue<double>>{};
+  final _rawWindow = <String, EegFloat64RingBuffer>{};
+  final _ffrScratch = <String, Float64List>{};
+  ({double snr, double hz})? _cachedIsolateFfr;
+  bool _ffrRequestInFlight = false;
   Timer? _ticker;
   final _subs = <StreamSubscription<dynamic>>[];
   StreamSubscription<EegRecording?>? _recordingSub;
@@ -273,8 +278,12 @@ class EegSessionCaptureController extends SintController {
     segmentOpen.value = false;
     segmentPracticeId.value = null;
 
+    if (hub.isDspIsolateActive) {
+      await _refreshIsolateFfr(seg);
+    }
+
     // Fold the second in progress so a short session is not lost.
-    _flushAccumulator(DateTime.now());
+    _flushAccumulator(DateTime.now(), closingSegment: seg);
 
     final end = endedAt ?? DateTime.now();
     final rows = [
@@ -351,6 +360,10 @@ class EegSessionCaptureController extends SintController {
     _totalSamples++;
     _acc.samples++;
 
+    // When the background DSP isolate is active, it maintains the 8-second
+    // stimulus FFR ring buffers off the UI thread.
+    if (hub.isDspIsolateActive) return;
+
     final rate = hub.connectedDevice?.sampleRate ?? 0;
     if (rate <= 0 || ffrWindow <= Duration.zero) return;
     final cap = (ffrWindow.inMicroseconds * rate / 1000000)
@@ -361,11 +374,11 @@ class EegSessionCaptureController extends SintController {
           _rawWindow.length >= _maxRawChannels) {
         continue;
       }
-      final q = _rawWindow.putIfAbsent(e.key, ListQueue<double>.new);
-      q.addLast(e.value.isFinite ? e.value : 0.0);
-      while (q.length > cap) {
-        q.removeFirst();
-      }
+      final ring = _rawWindow.putIfAbsent(
+        e.key,
+        () => EegFloat64RingBuffer(cap),
+      )..ensureCapacity(cap);
+      ring.push(e.value.isFinite ? e.value : 0.0);
     }
   }
 
@@ -399,9 +412,12 @@ class EegSessionCaptureController extends SintController {
       _lastSampleAt = null;
       _acc = _Accumulator();
       _rawWindow.clear();
+      _ffrScratch.clear();
+      _cachedIsolateFfr = null;
       _followRecording();
     } else if (state == EegConnectionState.disconnected ||
         state == EegConnectionState.error) {
+      _cachedIsolateFfr = null;
       liveStats.value = EegLiveStats.idle;
     }
   }
@@ -445,10 +461,31 @@ class EegSessionCaptureController extends SintController {
         seg.lastExcluded = List.of(excluded);
         seg.contactChanges.add(EegContactChange(t: _elapsed(seg), excluded: List.of(excluded)));
       }
+      if (hub.isDspIsolateActive) {
+        unawaited(_refreshIsolateFfr(seg));
+      }
+    } else {
+      _cachedIsolateFfr = null;
     }
   }
 
-  void _flushAccumulator(DateTime now) {
+  Future<void> _refreshIsolateFfr(_Segment seg) async {
+    final hz = _stimulusHz(seg);
+    if (hz == null || !hub.isDspIsolateActive) {
+      _cachedIsolateFfr = null;
+      return;
+    }
+    if (_ffrRequestInFlight) return;
+    _ffrRequestInFlight = true;
+    try {
+      final result = await hub.computeIsolateFfr(stimulusHz: hz);
+      if (!_disposed) _cachedIsolateFfr = result;
+    } finally {
+      _ffrRequestInFlight = false;
+    }
+  }
+
+  void _flushAccumulator(DateTime now, {_Segment? closingSegment}) {
     final connected = hub.connectionState == EegConnectionState.streaming;
     final acc = _acc;
     _acc = _Accumulator();
@@ -469,7 +506,7 @@ class EegSessionCaptureController extends SintController {
     final n = acc.channelReadings == 0 ? 1 : acc.channelReadings;
     final m = _lastMetrics;
     final coherence = hub.lastCoherence;
-    final ffr = _frequencyFollowing();
+    final ffr = _frequencyFollowing(closingSegment ?? _segment);
     _rows.addLast(_TimedRow(
       at: now,
       row: EegCaptureRow(
@@ -504,8 +541,8 @@ class EegSessionCaptureController extends SintController {
   /// Stimulus the host is playing, from the latest context sample of the
   /// open segment: the isochronic pulse when on, otherwise the binaural
   /// beat. Null when neither is set.
-  double? _stimulusHz() {
-    final ctx = _segment?.context;
+  double? _stimulusHz([_Segment? seg]) {
+    final ctx = (seg ?? _segment)?.context;
     if (ctx == null || ctx.isEmpty) return null;
     final last = ctx.last;
     final iso = last.hz(EegContextKeys.isochronicHz);
@@ -518,23 +555,44 @@ class EegSessionCaptureController extends SintController {
   /// SNR at the stimulus frequency, averaged over up to [ffrMaxChannels]
   /// electrodes in contact (temporal and posterior first: auditory and
   /// resting-alpha cortex).
-  ({double snr, double hz})? _frequencyFollowing() {
-    final hz = _stimulusHz();
+  ({double snr, double hz})? _frequencyFollowing([_Segment? activeSeg]) {
+    final seg = activeSeg ?? _segment;
+    final hz = _stimulusHz(seg);
     final rate = hub.connectedDevice?.sampleRate ?? 0;
-    if (hz == null || rate <= 0 || _segment == null) return null;
+    if (hz == null || rate <= 0 || seg == null) return null;
+
+    if (hub.isDspIsolateActive) {
+      final cached = _cachedIsolateFfr;
+      return (cached != null && (cached.hz - hz).abs() < 1e-6) ? cached : null;
+    }
+
     final excluded = hub.excludedChannels.toSet();
     final full = (ffrWindow.inMicroseconds * rate / 1000000).round();
     final channels = _rawWindow.keys
         .where((c) => !excluded.contains(c) && _rawWindow[c]!.length >= full)
         .toList()
       ..sort((a, b) => _ffrPriority(a).compareTo(_ffrPriority(b)));
-    final snrs = <double>[];
+    var snrSum = 0.0;
+    var snrCount = 0;
     for (final c in channels.take(ffrMaxChannels)) {
-      final v = EegSpectral.frequencyFollowingSnr(_rawWindow[c]!.toList(), rate.toDouble(), hz);
-      if (v != null) snrs.add(v);
+      final ring = _rawWindow[c]!;
+      var scratch = _ffrScratch[c];
+      if (scratch == null || scratch.length != ring.length) {
+        scratch = Float64List(ring.length);
+        _ffrScratch[c] = scratch;
+      }
+      final v = EegSpectral.frequencyFollowingSnr(
+        ring.toFloat64List(scratch),
+        rate.toDouble(),
+        hz,
+      );
+      if (v != null && v.isFinite) {
+        snrSum += v;
+        snrCount++;
+      }
     }
-    if (snrs.isEmpty) return null;
-    return (snr: snrs.reduce((a, b) => a + b) / snrs.length, hz: hz);
+    if (snrCount == 0) return null;
+    return (snr: snrSum / snrCount, hz: hz);
   }
 
   static int _ffrPriority(String channel) {

@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 /// One EEG notification from a Muse electrode characteristic.
 class MuseEegPacket {
   /// 16-bit rolling counter; the four electrode characteristics share it,
@@ -50,7 +52,7 @@ class MusePacketParser {
     if (bytes.length < packetLength) return null;
 
     final index = ((bytes[0] & 0xFF) << 8) | (bytes[1] & 0xFF);
-    final samples = List<double>.filled(samplesPerPacket, 0.0);
+    final samples = Float64List(samplesPerPacket);
 
     // 12-bit fields alternate between byte-aligned and nibble-aligned.
     var bit = 16;

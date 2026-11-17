@@ -1,9 +1,12 @@
 import 'dart:collection';
+import 'dart:typed_data';
 
 import '../../domain/models/eeg_band_power.dart';
 import '../../domain/models/eeg_channel_info.dart';
 import '../../domain/models/eeg_sample.dart';
 import '../../domain/use_cases/eeg_processor_service.dart';
+import 'eeg_ring_buffer.dart';
+import 'eeg_signal_processor.dart';
 
 /// Sliding-window spectral analysis over a raw stream, for devices that
 /// do not compute band powers themselves.
@@ -17,7 +20,15 @@ class EegBandPowerDeriver {
   final Duration window;
   final Duration hop;
 
-  final _buffer = ListQueue<EegSample>();
+  // Zero-GC fast path for the stock EegSignalProcessor: contiguous Float64List
+  // ring buffers per electrode instead of retaining boxed EegSample maps.
+  final _channelRings = <String, EegFloat64RingBuffer>{};
+  final _channelScratch = <String, Float64List>{};
+  int _bufferedCount = 0;
+
+  // Fallback queue used only when a custom EegProcessorService implementation
+  // (e.g. test mock) requires List<EegSample>.
+  final _fallbackBuffer = ListQueue<EegSample>();
   int _sinceLastEmit = 0;
 
   EegBandPowerDeriver({
@@ -27,7 +38,11 @@ class EegBandPowerDeriver {
   });
 
   void reset() {
-    _buffer.clear();
+    for (final ring in _channelRings.values) {
+      ring.clear();
+    }
+    _bufferedCount = 0;
+    _fallbackBuffer.clear();
     _sinceLastEmit = 0;
   }
 
@@ -41,19 +56,62 @@ class EegBandPowerDeriver {
     final windowSamples = _samplesFor(window, sampleRate);
     final hopSamples = _samplesFor(hop, sampleRate);
 
-    _buffer.addLast(sample);
-    while (_buffer.length > windowSamples) {
-      _buffer.removeFirst();
+    final directProcessor =
+        processor is EegSignalProcessor ? processor as EegSignalProcessor : null;
+
+    if (directProcessor != null) {
+      for (final ch in channels) {
+        final label = ch.name;
+        final ring = _channelRings.putIfAbsent(
+          label,
+          () => EegFloat64RingBuffer(windowSamples),
+        )..ensureCapacity(windowSamples);
+        ring.push(sample.channels[label] ?? 0.0);
+      }
+      if (_bufferedCount < windowSamples) _bufferedCount++;
+      _sinceLastEmit++;
+
+      if (_sinceLastEmit < hopSamples || _bufferedCount < windowSamples ~/ 2) {
+        return null;
+      }
+      _sinceLastEmit = 0;
+
+      final order = <String>[];
+      final windows = <String, List<double>>{};
+      for (final ch in channels) {
+        final label = ch.name;
+        final ring = _channelRings[label];
+        if (ring == null || ring.isEmpty) continue;
+        var scratch = _channelScratch[label];
+        if (scratch == null || scratch.length != ring.length) {
+          scratch = Float64List(ring.length);
+          _channelScratch[label] = scratch;
+        }
+        windows[label] = ring.toFloat64List(scratch);
+        order.add(label);
+      }
+      final frame = directProcessor.extractBandPowerFromWindows(
+        windows,
+        order,
+        sampleRate.toDouble(),
+      );
+      return frame.isEmpty ? null : frame;
+    }
+
+    _fallbackBuffer.addLast(sample);
+    while (_fallbackBuffer.length > windowSamples) {
+      _fallbackBuffer.removeFirst();
     }
     _sinceLastEmit++;
 
-    if (_sinceLastEmit < hopSamples || _buffer.length < windowSamples ~/ 2) {
+    if (_sinceLastEmit < hopSamples ||
+        _fallbackBuffer.length < windowSamples ~/ 2) {
       return null;
     }
     _sinceLastEmit = 0;
 
     final frame = processor.extractBandPower(
-      _buffer.toList(),
+      _fallbackBuffer.toList(),
       channels,
       sampleRate: sampleRate.toDouble(),
     );

@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 /// Canonical EEG bands in Hz, half-open `[low, high)`. The one definition
 /// every spectral computation in the module uses.
@@ -133,35 +134,58 @@ class EegCoherenceSpectrum {
 class EegSpectral {
   EegSpectral._();
 
-  static final _hannCache = <int, List<double>>{};
-  static final _twiddleCache = <String, ({List<double> cos, List<double> sin})>{};
+  static final _hannCache = <int, Float64List>{};
+  static final _hannNormCache = <int, double>{};
+  static final _twiddleCache = <String, ({Float64List cos, Float64List sin})>{};
   static const int _maxCacheEntries = 64;
 
-  static List<double> hann(int n) {
-    if (n <= 0) return const [];
+  static List<double> hann(int n) => _hannTyped(n);
+
+  static Float64List _hannTyped(int n) {
+    if (n <= 0) return Float64List(0);
     if (!_hannCache.containsKey(n) && _hannCache.length >= _maxCacheEntries) {
       _hannCache.clear();
+      _hannNormCache.clear();
     }
-    return _hannCache.putIfAbsent(
-      n,
-      () => n <= 1
-          ? List.filled(n, 1.0)
-          : [
-              for (var i = 0; i < n; i++)
-                0.5 - 0.5 * math.cos(2 * math.pi * i / (n - 1)),
-            ],
-    );
+    return _hannCache.putIfAbsent(n, () {
+      final w = Float64List(n);
+      if (n == 1) {
+        w[0] = 1.0;
+      } else {
+        final scale = 2.0 * math.pi / (n - 1);
+        for (var i = 0; i < n; i++) {
+          w[i] = 0.5 - 0.5 * math.cos(scale * i);
+        }
+      }
+      return w;
+    });
+  }
+
+  static double _hannNorm(int n) {
+    if (n <= 0) return 0.0;
+    final cached = _hannNormCache[n];
+    if (cached != null) return cached;
+    final w = _hannTyped(n);
+    var sumSq = 0.0;
+    for (var i = 0; i < n; i++) {
+      final v = w[i];
+      sumSq += v * v;
+    }
+    final norm = sumSq * n;
+    _hannNormCache[n] = norm;
+    return norm;
   }
 
   /// Removes the least-squares line, so electrode drift and the DC offset
   /// of consumer headsets (≈4200 µV on Emotiv) do not leak into delta.
   static List<double> detrend(List<double> x) {
     final n = x.length;
-    if (n < 2) return List.filled(n, 0.0);
-    final meanT = (n - 1) / 2;
+    final out = Float64List(n);
+    if (n < 2) return out;
+    final meanT = (n - 1) / 2.0;
     var meanX = 0.0;
-    for (final v in x) {
-      meanX += v;
+    for (var i = 0; i < n; i++) {
+      meanX += x[i];
     }
     meanX /= n;
     var num = 0.0, den = 0.0;
@@ -171,13 +195,52 @@ class EegSpectral {
       den += dt * dt;
     }
     final slope = den == 0 ? 0.0 : num / den;
-    return [for (var i = 0; i < n; i++) x[i] - meanX - slope * (i - meanT)];
+    for (var i = 0; i < n; i++) {
+      out[i] = x[i] - meanX - slope * (i - meanT);
+    }
+    return out;
   }
 
-  static List<double> _prepare(List<double> x) {
-    final d = detrend([for (final v in x) v.isFinite ? v : 0.0]);
-    final w = hann(d.length);
-    return [for (var i = 0; i < d.length; i++) d[i] * w[i]];
+  /// Sanitises non-finite samples, removes least-squares linear trend, and
+  /// applies the Hann window in place into [out] without allocating sublists.
+  static void _prepareSliceInto(
+    List<double> x,
+    int start,
+    int n,
+    Float64List out,
+  ) {
+    if (n < 2) {
+      for (var i = 0; i < n; i++) {
+        out[i] = 0.0;
+      }
+      return;
+    }
+    final meanT = (n - 1) / 2.0;
+    var meanX = 0.0;
+    for (var i = 0; i < n; i++) {
+      final v = x[start + i];
+      final safe = v.isFinite ? v : 0.0;
+      out[i] = safe;
+      meanX += safe;
+    }
+    meanX /= n;
+    var num = 0.0, den = 0.0;
+    for (var i = 0; i < n; i++) {
+      final dt = i - meanT;
+      num += dt * (out[i] - meanX);
+      den += dt * dt;
+    }
+    final slope = den == 0 ? 0.0 : num / den;
+    final w = _hannTyped(n);
+    for (var i = 0; i < n; i++) {
+      out[i] = (out[i] - meanX - slope * (i - meanT)) * w[i];
+    }
+  }
+
+  static Float64List _prepare(List<double> x) {
+    final out = Float64List(x.length);
+    _prepareSliceInto(x, 0, x.length, out);
+    return out;
   }
 
   static int _maxBin(int n, double fs, double maxHz) {
@@ -187,18 +250,19 @@ class EegSpectral {
     return math.min(n ~/ 2, (maxHz * n / fs).floor());
   }
 
-  static ({List<double> cos, List<double> sin}) _twiddles(int n, int bins) {
+  static ({Float64List cos, Float64List sin}) _twiddles(int n, int bins) {
     final key = '$n:$bins';
     if (!_twiddleCache.containsKey(key) &&
         _twiddleCache.length >= _maxCacheEntries) {
       _twiddleCache.clear();
     }
     return _twiddleCache.putIfAbsent(key, () {
-      final c = List<double>.filled(bins * n, 0);
-      final s = List<double>.filled(bins * n, 0);
+      final c = Float64List(bins * n);
+      final s = Float64List(bins * n);
       for (var k = 1; k <= bins; k++) {
+        final step = -2.0 * math.pi * k / n;
         for (var i = 0; i < n; i++) {
-          final a = -2.0 * math.pi * k * i / n;
+          final a = step * i;
           c[(k - 1) * n + i] = math.cos(a);
           s[(k - 1) * n + i] = math.sin(a);
         }
@@ -207,23 +271,29 @@ class EegSpectral {
     });
   }
 
-  /// Real/imaginary DFT of an already windowed segment, bins `1..bins`.
-  static (List<double>, List<double>) _dft(List<double> x, int bins) {
-    final n = x.length;
+  /// Real/imaginary DFT of an already windowed segment, bins `1..bins`, written
+  /// into pre-allocated [re] and [im] buffers.
+  static void _dftInto(
+    Float64List x,
+    int n,
+    int bins,
+    Float64List re,
+    Float64List im,
+  ) {
     final t = _twiddles(n, bins);
-    final re = List<double>.filled(bins, 0);
-    final im = List<double>.filled(bins, 0);
+    final cosTbl = t.cos;
+    final sinTbl = t.sin;
     for (var k = 0; k < bins; k++) {
       var r = 0.0, j = 0.0;
       final base = k * n;
       for (var i = 0; i < n; i++) {
-        r += x[i] * t.cos[base + i];
-        j += x[i] * t.sin[base + i];
+        final xi = x[i];
+        r += xi * cosTbl[base + i];
+        j += xi * sinTbl[base + i];
       }
       re[k] = r;
       im[k] = j;
     }
-    return (re, im);
   }
 
   /// Hann-windowed, detrended power spectrum up to [maxHz].
@@ -238,14 +308,22 @@ class EegSpectral {
     }
     final bins = _maxBin(n, fs, maxHz);
     if (bins < 1) return const EegSpectrum([], []);
-    final w = hann(n);
-    final norm = w.fold<double>(0.0, (a, v) => a + v * v) * n;
+    final norm = _hannNorm(n);
     if (norm <= 0) return const EegSpectrum([], []);
-    final (re, im) = _dft(_prepare(x), bins);
-    return EegSpectrum(
-      [for (var k = 1; k <= bins; k++) k * fs / n],
-      [for (var k = 0; k < bins; k++) (re[k] * re[k] + im[k] * im[k]) / norm],
-    );
+    final prepared = _prepare(x);
+    final re = Float64List(bins);
+    final im = Float64List(bins);
+    _dftInto(prepared, n, bins, re, im);
+    final freqs = Float64List(bins);
+    final power = Float64List(bins);
+    final binScale = fs / n;
+    for (var k = 0; k < bins; k++) {
+      freqs[k] = (k + 1) * binScale;
+      final rk = re[k];
+      final ik = im[k];
+      power[k] = (rk * rk + ik * ik) / norm;
+    }
+    return EegSpectrum(freqs, power);
   }
 
   /// Welch coherence between [x] and [y] (same length, same rate):
@@ -277,29 +355,44 @@ class EegSpectral {
     final bins = _maxBin(seg, fs, maxHz);
     if (bins < 1) return EegCoherenceSpectrum.empty;
 
-    final sxx = List<double>.filled(bins, 0);
-    final syy = List<double>.filled(bins, 0);
-    final sxyRe = List<double>.filled(bins, 0);
-    final sxyIm = List<double>.filled(bins, 0);
+    final sxx = Float64List(bins);
+    final syy = Float64List(bins);
+    final sxyRe = Float64List(bins);
+    final sxyIm = Float64List(bins);
+    final workX = Float64List(seg);
+    final workY = Float64List(seg);
+    final xr = Float64List(bins);
+    final xi = Float64List(bins);
+    final yr = Float64List(bins);
+    final yi = Float64List(bins);
+
     var segments = 0;
     for (var start = 0; start + seg <= n; start += step) {
-      final (xr, xi) = _dft(_prepare(x.sublist(start, start + seg)), bins);
-      final (yr, yi) = _dft(_prepare(y.sublist(start, start + seg)), bins);
+      _prepareSliceInto(x, start, seg, workX);
+      _prepareSliceInto(y, start, seg, workY);
+      _dftInto(workX, seg, bins, xr, xi);
+      _dftInto(workY, seg, bins, yr, yi);
       for (var k = 0; k < bins; k++) {
-        sxx[k] += xr[k] * xr[k] + xi[k] * xi[k];
-        syy[k] += yr[k] * yr[k] + yi[k] * yi[k];
+        final xrk = xr[k], xik = xi[k];
+        final yrk = yr[k], yik = yi[k];
+        sxx[k] += xrk * xrk + xik * xik;
+        syy[k] += yrk * yrk + yik * yik;
         // X · conj(Y)
-        sxyRe[k] += xr[k] * yr[k] + xi[k] * yi[k];
-        sxyIm[k] += xi[k] * yr[k] - xr[k] * yi[k];
+        sxyRe[k] += xrk * yrk + xik * yik;
+        sxyIm[k] += xik * yrk - xrk * yik;
       }
       segments++;
     }
 
-    final msc = List<double>.filled(bins, double.nan);
-    final imag = List<double>.filled(bins, double.nan);
+    final msc = Float64List(bins);
+    final imag = Float64List(bins);
     for (var k = 0; k < bins; k++) {
       final den = sxx[k] * syy[k];
-      if (den <= 1e-24) continue;
+      if (den <= 1e-24) {
+        msc[k] = double.nan;
+        imag[k] = double.nan;
+        continue;
+      }
       msc[k] = ((sxyRe[k] * sxyRe[k] + sxyIm[k] * sxyIm[k]) / den).clamp(0.0, 1.0);
       imag[k] = (sxyIm[k].abs() / math.sqrt(den)).clamp(0.0, 1.0);
     }
@@ -307,8 +400,13 @@ class EegSpectral {
     // Overlapping segments are not independent; count only the disjoint
     // ones for the significance threshold (conservative).
     final independent = math.max(2, n ~/ seg);
+    final freqs = Float64List(bins);
+    final binScale = fs / seg;
+    for (var k = 0; k < bins; k++) {
+      freqs[k] = (k + 1) * binScale;
+    }
     return EegCoherenceSpectrum(
-      freqs: [for (var k = 1; k <= bins; k++) k * fs / seg],
+      freqs: freqs,
       msc: msc,
       imaginary: imag,
       segments: segments,
@@ -317,10 +415,13 @@ class EegSpectral {
     );
   }
 
-  /// Windowed power of [x] at exactly [f] Hz (single-frequency DFT, not
-  /// bin-aligned). Same normalisation as [powerSpectrum].
+  /// Windowed power of [prepared] at exactly [f] Hz (single-frequency DFT via
+  /// Goertzel's recurrence, not bin-aligned). Same normalisation as
+  /// [powerSpectrum], requiring a single `cos` evaluation instead of `2N`
+  /// trigonometric calls.
   static double powerAt(List<double> prepared, double fs, double f, double norm) {
-    if (prepared.isEmpty ||
+    final n = prepared.length;
+    if (n == 0 ||
         !fs.isFinite ||
         fs <= 0 ||
         !f.isFinite ||
@@ -328,13 +429,17 @@ class EegSpectral {
         norm <= 0) {
       return 0.0;
     }
-    var r = 0.0, j = 0.0;
-    final w = -2.0 * math.pi * f / fs;
-    for (var i = 0; i < prepared.length; i++) {
-      r += prepared[i] * math.cos(w * i);
-      j += prepared[i] * math.sin(w * i);
+    final c = 2.0 * math.cos(2.0 * math.pi * f / fs);
+    var s1 = 0.0;
+    var s2 = 0.0;
+    for (var i = 0; i < n; i++) {
+      final s0 = prepared[i] + c * s1 - s2;
+      s2 = s1;
+      s1 = s0;
     }
-    return (r * r + j * j) / norm;
+    final magSq = s1 * s1 + s2 * s2 - c * s1 * s2;
+    if (!magSq.isFinite) return double.nan;
+    return (magSq < 0.0 ? 0.0 : magSq) / norm;
   }
 
   /// Steady-state response at a stimulus frequency: power at [f0] divided
@@ -370,16 +475,20 @@ class EegSpectral {
     final resolution = fs / n;
     if (resolution > exclude) return null;
     final prepared = _prepare(x);
-    final w = hann(n);
-    final norm = w.fold<double>(0.0, (a, v) => a + v * v) * n;
+    final norm = _hannNorm(n);
 
     final signal = powerAt(prepared, fs, f0, norm);
     var noise = 0.0;
     var count = 0;
     for (var d = exclude + resolution; d <= neighbour + 1e-9; d += resolution) {
-      for (final f in [f0 - d, f0 + d]) {
-        if (f < 0.3) continue;
-        noise += powerAt(prepared, fs, f, norm);
+      final fLow = f0 - d;
+      if (fLow >= 0.3) {
+        noise += powerAt(prepared, fs, fLow, norm);
+        count++;
+      }
+      final fHigh = f0 + d;
+      if (fHigh >= 0.3) {
+        noise += powerAt(prepared, fs, fHigh, norm);
         count++;
       }
     }
