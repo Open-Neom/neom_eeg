@@ -3,7 +3,7 @@ import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hive/hive.dart';
+import 'package:hive_ce/hive_ce.dart';
 import 'package:neom_eeg/data/hub/eeg_driver_registry.dart';
 import 'package:neom_eeg/data/hub/eeg_hub.dart';
 import 'package:neom_eeg/data/implementations/eeg_coherence_tracker.dart';

@@ -2,7 +2,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hive/hive.dart';
+import 'package:hive_ce/hive_ce.dart';
 import 'package:neom_eeg/data/hub/eeg_driver_registry.dart';
 import 'package:neom_eeg/data/hub/eeg_hub.dart';
 import 'package:neom_eeg/data/implementations/eeg_calibration_builder.dart';

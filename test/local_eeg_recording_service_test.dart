@@ -1,7 +1,7 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:hive/hive.dart';
+import 'package:hive_ce/hive_ce.dart';
 import 'package:neom_eeg/data/implementations/local_eeg_recording_service.dart';
 import 'package:neom_eeg/domain/enums/eeg_device_type.dart';
 import 'package:neom_eeg/domain/enums/eeg_vendor.dart';

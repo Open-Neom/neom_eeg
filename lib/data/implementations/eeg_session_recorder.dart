@@ -1,6 +1,6 @@
 import 'dart:async';
 
-import 'package:hive/hive.dart';
+import 'package:hive_ce/hive_ce.dart';
 
 import '../../domain/enums/eeg_device_type.dart';
 import '../../domain/models/eeg_band_power.dart';

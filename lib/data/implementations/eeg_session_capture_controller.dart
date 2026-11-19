@@ -2,7 +2,7 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:typed_data';
 
-import 'package:hive/hive.dart';
+import 'package:hive_ce/hive_ce.dart';
 import 'package:sint/sint.dart';
 
 import '../../domain/enums/eeg_connection_state.dart';
