@@ -1,7 +1,8 @@
 name: neom_eeg
 description: Vendor-agnostic EEG hub (Emotiv via Cortex desktop/mobile, Muse BLE, pending OpenBCI/BrainBit/NeuroSky), signal processing and closed-loop neurofeedback for the Open Neom ecosystem.
 version: 0.4.0
-homepage: https://github.com/Cyberneom/neom_eeg
+homepage: https://www.openneom.dev
+repository: https://github.com/Open-Neom/neom_eeg
 publish_to: 'none'
 
 environment:
