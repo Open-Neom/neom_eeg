@@ -22,9 +22,7 @@ dependencies:
 
   neom_biofeedback: ^1.0.0
 
-  sint:
-    git:
-      url: git@github.com:Open-Neom/sint.git
+  sint: ^2.3.0
 
   flutter_blue_plus: ^2.3.15
 
